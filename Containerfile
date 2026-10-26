@@ -21,7 +21,11 @@ FROM docker.io/library/alpine:3.23.5@${ALPINE_DIGEST} AS build
 
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 
-RUN apk add --no-cache bash build-base curl musl-dev openssl-dev openssl-libs-static
+# Upgrade first: the pinned base ships whatever was current when it was
+# built, and the static libcrypto linked into the binary should be the
+# newest fixed release, not that snapshot.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache bash build-base curl musl-dev openssl-dev openssl-libs-static
 
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH="/opt/cargo/bin:${PATH}"
 COPY scripts/install-rust.sh /tmp/install-rust.sh
@@ -49,7 +53,11 @@ SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 # and ssh-add; tzdata for PR_TIMEZONE. pip only bootstraps the venv: both
 # the system package and the venv's own copy are removed once ansible-core
 # is installed, so nothing in the image can install more Python code.
-RUN apk add --no-cache ca-certificates git openssh-client python3 tzdata \
+# apk upgrade brings the packages preinstalled in the pinned base (libcrypto3,
+# libssl3, zlib, ...) to their fixed releases; apk add alone leaves them at
+# the base image's snapshot, which the lock review's scan reports.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates git openssh-client python3 tzdata \
     && apk add --no-cache --virtual .pip py3-pip
 
 COPY runtime/requirements.txt runtime/collections.yml /tmp/runtime/
