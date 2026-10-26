@@ -21,7 +21,7 @@ model, and the stage plan.
 |---|---|---|
 | 0 | Repository scaffold, toolbox, gates | done |
 | 1 | libcrypto FFI, crypto wrappers, common helpers | done |
-| 2 | HTTP server, auth, UI shell | planned |
+| 2 | HTTP server, auth, UI shell | done |
 | 3 | Store, keystore, secrets/inventory/repository pages | planned |
 | 4 | Run engine, templates, run logs | planned |
 | 5 | Scheduler | planned |
@@ -37,7 +37,11 @@ the toolbox image.
 ```bash
 make install   # once: build the toolbox and install the pre-commit hook
 make test      # the full gate
+make dev       # run the server at http://127.0.0.1:8080 (state in ./data)
 ```
+
+`make dev` prints a one-time setup token on first start; open
+http://127.0.0.1:8080, enter it, and choose the admin password.
 
 ## License
 

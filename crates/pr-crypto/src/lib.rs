@@ -174,6 +174,114 @@ impl fmt::Debug for SecretBytes {
     }
 }
 
+/// The 256-bit master key every other key is derived from. It is read once
+/// from a file outside the data directory (a Podman secret in production),
+/// held in memory for the life of the process, and cleansed on drop.
+pub struct MasterKey([u8; AES256_KEY_LEN]);
+
+/// The most a key file may hold: 64 hex digits plus surrounding whitespace.
+const KEY_FILE_LIMIT: usize = 256;
+
+impl MasterKey {
+    /// Parses 64 hex digits, ignoring surrounding whitespace.
+    pub fn from_hex(text: &[u8]) -> Result<Self> {
+        let trimmed = text.trim_ascii();
+        if trimmed.len() != AES256_KEY_LEN * 2 {
+            return Err(CryptoError);
+        }
+        let mut key = [0_u8; AES256_KEY_LEN];
+        let digit = |c: u8| char::from(c).to_digit(16).and_then(|d| u8::try_from(d).ok());
+        for (slot, &[hi, lo]) in key.iter_mut().zip(trimmed.as_chunks::<2>().0) {
+            if let (Some(hi), Some(lo)) = (digit(hi), digit(lo)) {
+                *slot = hi << 4 | lo;
+            } else {
+                cleanse(&mut key);
+                return Err(CryptoError);
+            }
+        }
+        if key.iter().all(|&b| b == 0) {
+            return Err(CryptoError);
+        }
+        Ok(Self(key))
+    }
+
+    /// Reads a key file of at most a few hundred bytes. The caller reports
+    /// which path failed; the error never says why, so it cannot leak key
+    /// material into a log.
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).map_err(|_| CryptoError)?;
+        // One byte past the limit tells an oversized file apart.
+        let mut text = [0_u8; KEY_FILE_LIMIT + 1];
+        let mut len = 0;
+        let read = loop {
+            match file.read(&mut text[len..]) {
+                Ok(0) => break Ok(len),
+                Ok(n) => {
+                    len += n;
+                    if len == text.len() {
+                        break Err(CryptoError);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break Err(CryptoError),
+            }
+        };
+        let key = read.and_then(|n| Self::from_hex(&text[..n]));
+        cleanse(&mut text);
+        key
+    }
+    /// A fresh random key as 64 hex digits, for `playbook-runner gen-key`.
+    pub fn generate_hex() -> Result<SecretBytes> {
+        let mut key: [u8; AES256_KEY_LEN] = random_array()?;
+        let text = hex(&key).into_bytes();
+        cleanse(&mut key);
+        Ok(SecretBytes::new(text))
+    }
+
+    /// A subkey for one purpose: HKDF-SHA256 with the purpose as `info`.
+    /// Distinct purposes yield independent keys, so a key used for sessions
+    /// can never decrypt a stored secret.
+    pub fn derive(&self, purpose: &str) -> Result<SubKey> {
+        let mut out = [0_u8; AES256_KEY_LEN];
+        hkdf_sha256(&self.0, b"playbook-runner", purpose.as_bytes(), &mut out)?;
+        Ok(SubKey(out))
+    }
+}
+
+impl Drop for MasterKey {
+    fn drop(&mut self) {
+        cleanse(&mut self.0);
+    }
+}
+
+impl fmt::Debug for MasterKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MasterKey(..)")
+    }
+}
+
+/// A derived 256-bit key, cleansed on drop.
+pub struct SubKey([u8; AES256_KEY_LEN]);
+
+impl SubKey {
+    pub fn bytes(&self) -> &[u8; AES256_KEY_LEN] {
+        &self.0
+    }
+}
+
+impl Drop for SubKey {
+    fn drop(&mut self) {
+        cleanse(&mut self.0);
+    }
+}
+
+impl fmt::Debug for SubKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SubKey(..)")
+    }
+}
+
 /// Lowercase hex.
 pub fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -306,6 +414,24 @@ mod tests {
         assert!(!ct_equal(b"abc", b"abd"));
         assert!(!ct_equal(b"abc", b"ab"));
         assert!(ct_equal(b"", b""));
+    }
+
+    #[test]
+    fn master_key_parsing_and_derivation() {
+        let text = MasterKey::generate_hex().unwrap();
+        assert_eq!(text.len(), 64);
+        let key = MasterKey::from_hex(text.expose()).unwrap();
+        let mut padded = b"  ".to_vec();
+        padded.extend_from_slice(text.expose());
+        padded.push(b'\n');
+        let same = MasterKey::from_hex(&padded).unwrap();
+        let a = key.derive("secrets").unwrap();
+        assert_eq!(a.bytes(), same.derive("secrets").unwrap().bytes());
+        assert_ne!(a.bytes(), key.derive("web").unwrap().bytes());
+        for bad in [&b""[..], b"abcd", &[b'0'; 64], &[b'g'; 64]] {
+            assert!(MasterKey::from_hex(bad).is_err());
+        }
+        assert_eq!(format!("{key:?}"), "MasterKey(..)");
     }
 
     #[test]

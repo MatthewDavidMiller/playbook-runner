@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="playbook-runner">
+  <rect width="32" height="32" rx="7" fill="#0a1119"/>
+  <path d="M9 7h11l4 4v14H9z" fill="none" stroke="#7cb8ff" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M14 13.5 19.5 16 14 18.5z" fill="#7cb8ff"/>
+</svg>

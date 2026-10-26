@@ -35,3 +35,7 @@ version = "0.1.0"
 [[package]]
 name = "pr-web"
 version = "0.1.0"
+dependencies = [
+ "pr-common",
+ "pr-crypto",
+]

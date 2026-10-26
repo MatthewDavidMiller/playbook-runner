@@ -4,6 +4,10 @@
 # Usage: ./scripts/toolbox.sh <command> [args...]
 #        ./scripts/toolbox.sh --build          Build (or rebuild) the image only
 #        ./scripts/toolbox.sh --shell          Interactive shell in the toolbox
+#        ./scripts/toolbox.sh --publish PORT <command> [args...]
+#                                              As the first form, with the
+#                                              container's PORT published on
+#                                              127.0.0.1:PORT (make dev)
 #
 # Rootless Podman is the only thing this needs from the host. Every compiler,
 # linter, and test tool the gates call lives in tools/toolbox.
@@ -72,11 +76,16 @@ build_toolbox() {
 }
 
 main() {
-    local tag mode="run"
+    local tag mode="run" publish=""
+    if [[ "${1:-}" == "--publish" ]]; then
+        publish="${2:?--publish needs a port}"
+        [[ "${publish}" =~ ^[0-9]+$ ]] || { echo "ERROR: --publish needs a port number" >&2; exit 2; }
+        shift 2
+    fi
     case "${1:-}" in
         --build) mode="build"; shift ;;
         --shell) mode="shell"; shift ;;
-        -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}"; exit 0 ;;
         "") echo "Usage: $0 <command> [args...]" >&2; exit 2 ;;
     esac
 
@@ -94,9 +103,19 @@ main() {
         -v "${HOME_VOLUME}:/toolbox-home"
         -w "${PROJECT_ROOT}"
         -e HOME=/toolbox-home
-        # No crate ever comes from a registry, so the gates need no network.
-        --network=none
     )
+    if [[ -n "${publish}" ]]; then
+        # Loopback only: the development server is never reachable from
+        # another machine.
+        args+=(-p "127.0.0.1:${publish}:${publish}")
+        [[ -t 0 ]] && args+=(-it)
+        for name in "${!PR_@}"; do
+            [[ "${name}" == PR_IN_TOOLBOX ]] || args+=(-e "${name}")
+        done
+    else
+        # No crate ever comes from a registry, so the gates need no network.
+        args+=(--network=none)
+    fi
     if [[ "${mode}" == "shell" ]]; then
         args+=(-it "${tag}" bash)
     else

@@ -1,10 +1,119 @@
 //! The playbook-runner entry point.
+//!
+//! ```text
+//! playbook-runner [serve]   Run the web interface (the container's command)
+//! playbook-runner gen-key   Print a new 256-bit master key as 64 hex digits
+//! playbook-runner passwd    Set the admin password from one line on stdin
+//! playbook-runner version   Print the version
+//! ```
+//!
+//! Configuration comes from the environment; see `pr_web::config`.
 
 #![forbid(unsafe_code)]
 
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::process::ExitCode;
+use std::sync::Arc;
+
+use pr_common::{Error, Result, fsio};
+use pr_crypto::MasterKey;
+use pr_web::app::App;
+use pr_web::auth::Auth;
+use pr_web::config::Config;
+
+fn load_master_key(config: &Config) -> Result<MasterKey> {
+    MasterKey::load(&config.master_key_file).map_err(|_| {
+        Error::new(format!(
+            "cannot read a 64-hex-digit master key from {} (set PR_MASTER_KEY_FILE)",
+            config.master_key_file.display()
+        ))
+    })
+}
+
+fn serve() -> Result<()> {
+    let config = Config::from_env()?;
+    fsio::mkdir_all(&config.data_dir, 0o700)?;
+    let master = load_master_key(&config)?;
+    let web_key = master.derive("web").map_err(|_| Error::new("key derivation failed"))?;
+    let auth = Auth::new(
+        &config.data_dir,
+        web_key,
+        config.session_seconds,
+        config.admin_password_file.as_deref(),
+    )?;
+    if let Some(token) = auth.setup_token() {
+        eprintln!(
+            "playbook-runner: no admin password is set; open /setup with setup token {token}"
+        );
+    }
+    let listener = TcpListener::bind(config.listen)
+        .map_err(|e| Error::new(format!("cannot listen on {}: {e}", config.listen)))?;
+    eprintln!("playbook-runner {} listening on {}", pr_common::VERSION, config.listen);
+    let app = Arc::new(App::new(config, auth));
+    pr_web::http::serve(&listener, &app);
+    Ok(())
+}
+
+fn gen_key() -> Result<()> {
+    let key = MasterKey::generate_hex().map_err(|_| Error::new("randomness unavailable"))?;
+    let mut out = io::stdout().lock();
+    out.write_all(key.expose())?;
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+fn passwd() -> Result<()> {
+    let config = Config::from_env()?;
+    fsio::mkdir_all(&config.data_dir, 0o700)?;
+    let mut buf = [0_u8; 512];
+    let mut len = 0;
+    let mut stdin = io::stdin().lock();
+    loop {
+        match stdin.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                len += n;
+                if len == buf.len() || buf[..len].contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let line = buf[..len].split(|&b| b == b'\n').next().unwrap_or_default();
+    let result = std::str::from_utf8(line)
+        .map_err(|_| Error::new("the password must be UTF-8"))
+        .and_then(|p| {
+            pr_web::auth::validate_new_password(p.trim_end_matches('\r'))?;
+            let mut hash = pr_web::auth::hash_password(p.trim_end_matches('\r'))?;
+            hash.push('\n');
+            fsio::atomic_replace(config.data_dir.join("admin.password"), hash.as_bytes(), 512)
+        });
+    pr_crypto::cleanse(&mut buf);
+    result?;
+    eprintln!("Admin password updated. Restart the server to end existing sessions.");
+    Ok(())
+}
 
 fn main() -> ExitCode {
-    eprintln!("playbook-runner: not yet implemented");
-    ExitCode::FAILURE
+    let command = std::env::args().nth(1).unwrap_or_else(|| "serve".to_owned());
+    let result = match command.as_str() {
+        "serve" => serve(),
+        "gen-key" => gen_key(),
+        "passwd" => passwd(),
+        "version" | "--version" => {
+            println!("playbook-runner {}", pr_common::VERSION);
+            Ok(())
+        }
+        _ => Err(Error::new("usage: playbook-runner [serve|gen-key|passwd|version]")),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("playbook-runner: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
