@@ -1,0 +1,15 @@
+[package]
+name = "pr-web"
+description = "The HTTP operator interface and the playbook-runner binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "playbook-runner"
+path = "src/bin/playbook-runner.rs"

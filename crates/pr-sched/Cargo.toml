@@ -1,0 +1,11 @@
+[package]
+name = "pr-sched"
+description = "Cron expressions and time-zone-correct next-run calculation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

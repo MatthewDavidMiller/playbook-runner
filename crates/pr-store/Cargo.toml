@@ -1,0 +1,11 @@
+[package]
+name = "pr-store"
+description = "The data directory, its typed records, and the encrypted keystore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
