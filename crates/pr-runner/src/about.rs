@@ -103,12 +103,12 @@ mod tests {
         let ansible = "ansible-playbook [core 2.21.3]\n  config file = None\n  python version = 3.12.15 (main, Oct  1 2026) [GCC] (/opt/venv/bin/python3)\n";
         assert_eq!(ansible_core_version(ansible), "2.21.3");
         assert_eq!(python_version(ansible), "3.12.15");
-        let list = r#"{"/usr/share/ansible/collections/ansible_collections": {"community.general": {"version": "8.3.0"}, "ansible.posix": {"version": "1.5.4"}}}"#;
+        let list = r#"{"/usr/share/ansible/collections/ansible_collections": {"community.general": {"version": "13.5.0"}, "ansible.posix": {"version": "2.2.2"}}}"#;
         assert_eq!(
             collections(list),
             [
-                ("ansible.posix".to_owned(), "1.5.4".to_owned()),
-                ("community.general".to_owned(), "8.3.0".to_owned())
+                ("ansible.posix".to_owned(), "2.2.2".to_owned()),
+                ("community.general".to_owned(), "13.5.0".to_owned())
             ]
         );
         assert!(collections("not json").is_empty());
