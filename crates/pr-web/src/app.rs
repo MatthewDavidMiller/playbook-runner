@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::net::IpAddr;
 
 use pr_common::rand;
+use pr_store::Store;
 
 use crate::auth::{Auth, LOGIN_COOKIE, SESSION_COOKIE};
 use crate::config::Config;
@@ -23,6 +24,7 @@ const FAVICON: &str = include_str!("../static/favicon.svg");
 pub struct App {
     pub config: Config,
     pub auth: Auth,
+    pub store: Store,
 }
 
 /// A signed-in request: the session identifier and its CSRF token.
@@ -33,8 +35,8 @@ pub struct Session {
 }
 
 impl App {
-    pub fn new(config: Config, auth: Auth) -> Self {
-        Self { config, auth }
+    pub fn new(config: Config, auth: Auth, store: Store) -> Self {
+        Self { config, auth, store }
     }
 
     /// The client address used for throttling: the right-most
@@ -178,6 +180,13 @@ impl App {
         Some(match segments {
             [] => self.dashboard(s),
             ["settings"] => self.settings(s),
+            ["secrets"] => self.secrets_page(s),
+            ["secrets", id] => return self.secret_page(s, id),
+            ["inventories"] => self.inventories_page(s),
+            ["inventories", id] => return self.inventory_page(s, id),
+            ["repositories"] => self.repositories_page(s),
+            ["repositories", id] => return self.repository_page(s, id),
+            ["known-hosts"] => self.known_hosts_page(s),
             [section] if html::NAV.iter().any(|(_, _, key)| key == section) => {
                 self.placeholder(s, section)
             }
@@ -195,6 +204,16 @@ impl App {
         Some(match segments {
             ["logout"] => self.logout(s),
             ["settings", "password"] => self.change_password(s, form),
+            ["secrets"] => self.secret_create(s, form),
+            ["secrets", id] => return self.secret_update(s, id, form),
+            ["secrets", id, "delete"] => return self.secret_delete(s, id),
+            ["inventories"] => self.inventory_create(s, form),
+            ["inventories", id] => return self.inventory_update(s, id, form),
+            ["inventories", id, "delete"] => return self.inventory_delete(s, id),
+            ["repositories"] => self.repository_create(s, form),
+            ["repositories", id] => return self.repository_update(s, id, form),
+            ["repositories", id, "delete"] => return self.repository_delete(s, id),
+            ["known-hosts"] => self.known_hosts_save(s, form),
             _ => return None,
         })
     }

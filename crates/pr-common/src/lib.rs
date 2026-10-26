@@ -8,11 +8,13 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+pub mod base64;
 pub mod buf;
 pub mod error;
 pub mod fsio;
 pub mod json;
 pub mod rand;
+pub mod sshkey;
 pub mod timefmt;
 
 pub use error::{Error, Result};

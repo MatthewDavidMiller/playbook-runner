@@ -27,6 +27,10 @@ version = "0.1.0"
 [[package]]
 name = "pr-store"
 version = "0.1.0"
+dependencies = [
+ "pr-common",
+ "pr-crypto",
+]
 
 [[package]]
 name = "pr-sys"
@@ -38,4 +42,5 @@ version = "0.1.0"
 dependencies = [
  "pr-common",
  "pr-crypto",
+ "pr-store",
 ]

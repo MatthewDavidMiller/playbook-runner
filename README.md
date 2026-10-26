@@ -22,7 +22,7 @@ model, and the stage plan.
 | 0 | Repository scaffold, toolbox, gates | done |
 | 1 | libcrypto FFI, crypto wrappers, common helpers | done |
 | 2 | HTTP server, auth, UI shell | done |
-| 3 | Store, keystore, secrets/inventory/repository pages | planned |
+| 3 | Store, keystore, secrets/inventory/repository pages | done |
 | 4 | Run engine, templates, run logs | planned |
 | 5 | Scheduler | planned |
 | 6 | Production image | planned |

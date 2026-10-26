@@ -7,5 +7,9 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+pr-common = { path = "../pr-common" }
+pr-crypto = { path = "../pr-crypto" }
+
 [lints]
 workspace = true

@@ -4,6 +4,8 @@
 //! playbook-runner [serve]   Run the web interface (the container's command)
 //! playbook-runner gen-key   Print a new 256-bit master key as 64 hex digits
 //! playbook-runner passwd    Set the admin password from one line on stdin
+//! playbook-runner rekey     Re-encrypt the data directory from the key in
+//!                           PR_OLD_MASTER_KEY_FILE to PR_MASTER_KEY_FILE
 //! playbook-runner version   Print the version
 //! ```
 //!
@@ -18,6 +20,7 @@ use std::sync::Arc;
 
 use pr_common::{Error, Result, fsio};
 use pr_crypto::MasterKey;
+use pr_store::Store;
 use pr_web::app::App;
 use pr_web::auth::Auth;
 use pr_web::config::Config;
@@ -36,6 +39,7 @@ fn serve() -> Result<()> {
     fsio::mkdir_all(&config.data_dir, 0o700)?;
     let master = load_master_key(&config)?;
     let web_key = master.derive("web").map_err(|_| Error::new("key derivation failed"))?;
+    let store = Store::open(&config.data_dir, &master)?;
     let auth = Auth::new(
         &config.data_dir,
         web_key,
@@ -50,7 +54,7 @@ fn serve() -> Result<()> {
     let listener = TcpListener::bind(config.listen)
         .map_err(|e| Error::new(format!("cannot listen on {}: {e}", config.listen)))?;
     eprintln!("playbook-runner {} listening on {}", pr_common::VERSION, config.listen);
-    let app = Arc::new(App::new(config, auth));
+    let app = Arc::new(App::new(config, auth, store));
     pr_web::http::serve(&listener, &app);
     Ok(())
 }
@@ -97,17 +101,30 @@ fn passwd() -> Result<()> {
     Ok(())
 }
 
+fn rekey() -> Result<()> {
+    let config = Config::from_env()?;
+    let old_path = std::env::var_os("PR_OLD_MASTER_KEY_FILE")
+        .ok_or_else(|| Error::new("set PR_OLD_MASTER_KEY_FILE to the current key"))?;
+    let old = MasterKey::load(std::path::Path::new(&old_path))
+        .map_err(|_| Error::new("cannot read the key in PR_OLD_MASTER_KEY_FILE"))?;
+    let new = load_master_key(&config)?;
+    let converted = pr_store::rekey(&config.data_dir, &old, &new)?;
+    eprintln!("Re-encrypted {converted} stored value(s); the data directory now uses the new key.");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let command = std::env::args().nth(1).unwrap_or_else(|| "serve".to_owned());
     let result = match command.as_str() {
         "serve" => serve(),
         "gen-key" => gen_key(),
         "passwd" => passwd(),
+        "rekey" => rekey(),
         "version" | "--version" => {
             println!("playbook-runner {}", pr_common::VERSION);
             Ok(())
         }
-        _ => Err(Error::new("usage: playbook-runner [serve|gen-key|passwd|version]")),
+        _ => Err(Error::new("usage: playbook-runner [serve|gen-key|passwd|rekey|version]")),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
