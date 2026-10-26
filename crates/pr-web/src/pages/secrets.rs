@@ -288,9 +288,10 @@ mod tests {
         let (v, f) = prepare_value(SecretKind::VaultPassword, "hunter2\r\n").unwrap();
         assert_eq!((v.as_slice(), f.as_str()), (&b"hunter2"[..], ""));
         assert!(prepare_value(SecretKind::VaultPassword, "\n").is_err());
-        let (v, f) = prepare_value(SecretKind::SshKey, sshkey::TEST_ONLY_KEY).unwrap();
+        let key = pr_common::testkey::generate("").unwrap();
+        let (v, f) = prepare_value(SecretKind::SshKey, &key.private).unwrap();
         assert!(v.ends_with(b"-----END OPENSSH PRIVATE KEY-----\n"));
-        assert_eq!(f, format!("ssh-ed25519 {}", sshkey::TEST_ONLY_KEY_FINGERPRINT));
+        assert_eq!(f, format!("ssh-ed25519 {}", key.fingerprint));
         assert!(prepare_value(SecretKind::SshKey, "not a key").is_err());
     }
 }

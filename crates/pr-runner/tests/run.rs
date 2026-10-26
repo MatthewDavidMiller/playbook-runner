@@ -31,6 +31,7 @@ struct Fixture {
     runner: Arc<Runner>,
     vault_id: String,
     key_id: String,
+    key_fingerprint: String,
     repo_id: String,
     inventory_id: String,
 }
@@ -122,7 +123,8 @@ impl Fixture {
             })
             .unwrap();
         let key_id = pr_store::new_id().unwrap();
-        store.put_blob("secret", &key_id, pr_common::sshkey::TEST_ONLY_KEY.as_bytes()).unwrap();
+        let ssh_key = pr_common::testkey::generate("").unwrap();
+        store.put_blob("secret", &key_id, ssh_key.private.as_bytes()).unwrap();
         store
             .put(Secret {
                 id: key_id.clone(),
@@ -173,7 +175,16 @@ impl Fixture {
         };
         let runner = Runner::new(Arc::clone(&store), &root.join("data"), cfg, 50).unwrap();
         runner.start().unwrap();
-        Self { root, store, runner, vault_id, key_id, repo_id, inventory_id }
+        Self {
+            root,
+            store,
+            runner,
+            vault_id,
+            key_id,
+            key_fingerprint: ssh_key.fingerprint,
+            repo_id,
+            inventory_id,
+        }
     }
 
     fn template(&self, playbook: &str, timeout_minutes: i64) -> String {
@@ -241,7 +252,7 @@ fn a_run_decrypts_through_the_pipe_uses_the_agent_and_masks_secrets() {
     assert!(log.contains("decrypted=plain-value-from-vault"), "{log}");
     assert!(log.contains("leak=********"), "{log}");
     assert!(!log.contains(VAULT_PASSWORD), "{log}");
-    assert!(log.contains(pr_common::sshkey::TEST_ONLY_KEY_FINGERPRINT), "{log}");
+    assert!(log.contains(&f.key_fingerprint), "{log}");
     assert!(log.contains("--vault-id=default@/dev/fd/200"));
     // The scratch directory is gone, and with it the decrypted inventory.
     assert_eq!(fs::read_dir(f.root.join("work")).unwrap().count(), 0);

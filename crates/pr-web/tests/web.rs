@@ -380,7 +380,8 @@ fn secrets_are_write_only_and_never_on_disk_in_plaintext() {
         &format!("csrf_token={csrf}&name=Homelab+vault&kind=vault_password&vault_id=default&value={password}"),
     );
     assert_eq!(r.header("location"), Some("/secrets"));
-    let key = pr_common::sshkey::TEST_ONLY_KEY;
+    let generated = pr_common::testkey::generate("").unwrap();
+    let key = generated.private.as_str();
     s.post(
         "/secrets",
         &[&session],
@@ -392,7 +393,7 @@ fn secrets_are_write_only_and_never_on_disk_in_plaintext() {
         "{}",
         list.body
     );
-    assert!(list.body.contains(pr_common::sshkey::TEST_ONLY_KEY_FINGERPRINT));
+    assert!(list.body.contains(&generated.fingerprint));
     let id = first_id(&list, "secrets");
     let detail = s.get(&format!("/secrets/{id}"), &[&session]);
     for page in [&list, &detail] {
@@ -418,7 +419,8 @@ fn secrets_are_write_only_and_never_on_disk_in_plaintext() {
 fn records_in_use_cannot_be_deleted() {
     let s = Server::start("in-use");
     let (session, csrf) = s.sign_in(PASSWORD);
-    let key = pr_common::sshkey::TEST_ONLY_KEY;
+    let generated = pr_common::testkey::generate("").unwrap();
+    let key = generated.private.as_str();
     s.post(
         "/secrets",
         &[&session],

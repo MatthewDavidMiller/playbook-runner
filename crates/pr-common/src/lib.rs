@@ -15,6 +15,7 @@ pub mod fsio;
 pub mod json;
 pub mod rand;
 pub mod sshkey;
+pub mod testkey;
 pub mod timefmt;
 
 pub use error::{Error, Result};

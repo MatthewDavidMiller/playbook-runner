@@ -66,47 +66,23 @@ pub fn fingerprint(sha256_of_blob: &[u8]) -> String {
     format!("SHA256:{}", base64::encode_unpadded(sha256_of_blob))
 }
 
-/// A throwaway ed25519 key generated solely for this repository's tests
-/// (`ssh-keygen -t ed25519 -N "" -C test`). It grants access to nothing.
-#[doc(hidden)]
-pub const TEST_ONLY_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACA8Tljs8s7hm+1XlBx1CnCaAPrqj4/69ZqXTWRs5++ISwAAAIgl0GsUJdBr
-FAAAAAtzc2gtZWQyNTUxOQAAACA8Tljs8s7hm+1XlBx1CnCaAPrqj4/69ZqXTWRs5++ISw
-AAAEBWjtd/CbqqYVJZ9fmVTlYxSEJKZBO7DR7iWQbbI/gRTTxOWOzyzuGb7VeUHHUKcJoA
-+uqPj/r1mpdNZGzn74hLAAAABHRlc3QB
------END OPENSSH PRIVATE KEY-----
-";
-
-/// The fingerprint `ssh-keygen -l` prints for [`TEST_ONLY_KEY`].
-#[doc(hidden)]
-pub const TEST_ONLY_KEY_FINGERPRINT: &str = "SHA256:bONoM4jTqdMZh9q1BTJF8tbDRBC7L4gbi9apYSXP74M";
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The same, protected by the passphrase "secret".
-    const ENCRYPTED_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDseOLGmX
-m2gTT+pEHJcupIAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIK/pcQp/wiimfYOY
-Qmn5CjTuE6UVUkt1vt7trK16AftDAAAAkIUd4bpTkZMWsE6ypi0lwaMxXL7szI8GbsGy8w
-kuCDuWtHZCCiKUl6vhlXjGvlNQaIA9qbQTVdb2ZhKQq+RwqDuMIuQ5fJnumpKSeuj52Tlj
-rQBss8XkueoZUN7GjUUoreb4KTyf3Xre/Kz+4LVQ+fXogEK+M7u0rdVNeLmMwsmXy22GZ4
-VK/SK8u876CUOu+A==
------END OPENSSH PRIVATE KEY-----
-";
+    use crate::testkey;
 
     #[test]
     fn parses_an_unencrypted_key() {
-        let info = parse_private_key(TEST_ONLY_KEY).unwrap();
+        let key = testkey::generate("").unwrap();
+        let info = parse_private_key(&key.private).unwrap();
         assert_eq!(info.algorithm, "ssh-ed25519");
         assert_eq!(info.public_blob.len(), 51);
     }
 
     #[test]
     fn refuses_passphrase_protected_keys() {
-        let err = parse_private_key(ENCRYPTED_KEY).unwrap_err();
+        let key = testkey::generate("secret").unwrap();
+        let err = parse_private_key(&key.private).unwrap_err();
         assert!(err.message().contains("passphrase"), "{err}");
     }
 
@@ -119,7 +95,14 @@ VK/SK8u876CUOu+A==
             )
             .is_err()
         );
-        let truncated = TEST_ONLY_KEY.replace("+uqPj/r1mpdNZGzn74hLAAAABHRlc3QB", "");
+        // Drop the last body line: the private section is cut short.
+        let key = testkey::generate("").unwrap();
+        let mut lines: Vec<&str> = key.private.lines().collect();
+        lines.remove(lines.len() - 2);
+        let truncated = lines.join(
+            "
+",
+        );
         assert!(parse_private_key(&truncated).is_err());
     }
 }
