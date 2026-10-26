@@ -74,6 +74,45 @@ pub fn branch(s: &str) -> Result<String> {
     Ok(s.to_owned())
 }
 
+/// A playbook path inside the repository: relative, no `..`, a YAML file.
+pub fn playbook(s: &str) -> Result<String> {
+    let s = s.trim().trim_start_matches("./");
+    let chars_ok = s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b));
+    let yaml = std::path::Path::new(s)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml"));
+    if s.is_empty()
+        || s.len() > 255
+        || !chars_ok
+        || !yaml
+        || s.starts_with(['/', '-', '.'])
+        || s.split('/').any(|part| part.is_empty() || part == "..")
+    {
+        return fail("Enter the playbook's path in the repository, such as site.yml.");
+    }
+    Ok(s.to_owned())
+}
+
+/// An ansible host pattern for --limit, or "" for none.
+pub fn limit(s: &str) -> Result<String> {
+    let s = s.trim();
+    let ok = s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:,*!&[]-~@".contains(&b));
+    if s.len() > 512 || !ok || s.starts_with('-') {
+        return fail("The limit must be an ansible host pattern such as vm1 or web:&prod.");
+    }
+    Ok(s.to_owned())
+}
+
+/// A comma-separated tag list, or "" for none.
+pub fn tags(s: &str) -> Result<String> {
+    let s = s.trim();
+    let ok = s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.,-".contains(&b));
+    if s.len() > 512 || !ok || s.starts_with('-') {
+        return fail("Tags are comma-separated names of letters, digits, '_', '.', and '-'.");
+    }
+    Ok(s.to_owned())
+}
+
 /// Inventory text: UTF-8 (already, as a &str), bounded, no NUL, and with
 /// Windows line endings normalized.
 pub fn inventory(s: &str) -> Result<String> {
@@ -172,6 +211,28 @@ mod tests {
         assert_eq!(vault_id("").unwrap(), "default");
         assert!(vault_id("prod").is_ok());
         assert!(vault_id("-x").is_err() && vault_id("a@b").is_err());
+    }
+
+    #[test]
+    fn playbooks_limits_and_tags() {
+        assert_eq!(playbook("./update_homelab_vms.yml").unwrap(), "update_homelab_vms.yml");
+        assert_eq!(playbook("plays/site.yaml").unwrap(), "plays/site.yaml");
+        for bad in [
+            "",
+            "../x.yml",
+            "/etc/x.yml",
+            "a/../b.yml",
+            "x.sh",
+            "-x.yml",
+            "a//b.yml",
+            ".hidden.yml",
+        ] {
+            assert!(playbook(bad).is_err(), "{bad}");
+        }
+        assert!(limit("vm1,web:&prod:!db*").is_ok());
+        assert!(limit("-e x").is_err() && limit("a b").is_err());
+        assert!(tags("update,reboot").is_ok());
+        assert!(tags("a b").is_err() && tags("-x").is_err());
     }
 
     #[test]

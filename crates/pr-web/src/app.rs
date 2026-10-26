@@ -8,8 +8,10 @@
 
 use std::fmt::Write as _;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use pr_common::rand;
+use pr_runner::Runner;
 use pr_store::Store;
 
 use crate::auth::{Auth, LOGIN_COOKIE, SESSION_COOKIE};
@@ -24,7 +26,8 @@ const FAVICON: &str = include_str!("../static/favicon.svg");
 pub struct App {
     pub config: Config,
     pub auth: Auth,
-    pub store: Store,
+    pub store: Arc<Store>,
+    pub runner: Arc<Runner>,
 }
 
 /// A signed-in request: the session identifier and its CSRF token.
@@ -35,8 +38,8 @@ pub struct Session {
 }
 
 impl App {
-    pub fn new(config: Config, auth: Auth, store: Store) -> Self {
-        Self { config, auth, store }
+    pub fn new(config: Config, auth: Auth, store: Arc<Store>, runner: Arc<Runner>) -> Self {
+        Self { config, auth, store, runner }
     }
 
     /// The client address used for throttling: the right-most
@@ -187,6 +190,11 @@ impl App {
             ["repositories"] => self.repositories_page(s),
             ["repositories", id] => return self.repository_page(s, id),
             ["known-hosts"] => self.known_hosts_page(s),
+            ["templates"] => self.templates_page(s),
+            ["templates", id] => return self.template_page(s, id),
+            ["runs"] => self.runs_page(s),
+            ["runs", n] => return self.run_page(s, n),
+            ["runs", n, "log"] => return self.run_log_download(n),
             [section] if html::NAV.iter().any(|(_, _, key)| key == section) => {
                 self.placeholder(s, section)
             }
@@ -214,6 +222,12 @@ impl App {
             ["repositories", id] => return self.repository_update(s, id, form),
             ["repositories", id, "delete"] => return self.repository_delete(s, id),
             ["known-hosts"] => self.known_hosts_save(s, form),
+            ["templates"] => self.template_create(s, form),
+            ["templates", id] => return self.template_update(s, id, form),
+            ["templates", id, "delete"] => return self.template_delete(s, id),
+            ["templates", id, "run"] => return self.template_run(s, id, false),
+            ["templates", id, "check"] => return self.template_run(s, id, true),
+            ["runs", n, "cancel"] => return self.run_cancel(s, n),
             _ => return None,
         })
     }
@@ -232,20 +246,25 @@ impl App {
     }
 
     fn dashboard(&self, s: &Session) -> Response {
+        let runs = self.runner.runs().recent(10).unwrap_or_default();
         let mut body = String::from("<h1>Dashboard</h1>\n");
-        body.push_str(
-            "<section class=\"card\" aria-labelledby=\"about-heading\">\n\
-             <h2 id=\"about-heading\">This instance</h2>\n<dl class=\"details-list\">\n",
-        );
+        body.push_str(&crate::pages::card("recent", "Recent runs"));
+        body.push_str(&self.runs_table(&runs));
+        body.push_str("<p><a href=\"/runs\">All runs</a> · <a href=\"/templates\">Run a template</a></p>\n</section>\n");
+        body.push_str(&crate::pages::card("about", "This instance"));
         let _ = write!(
             body,
-            "<dt>Version</dt><dd>{}</dd>\n<dt>Data directory</dt><dd><code>{}</code></dd>\n\
+            "<dl class=\"details-list\">\n<dt>Version</dt><dd>{}</dd>\n<dt>Data directory</dt><dd><code>{}</code></dd>\n\
              <dt>Schedule time zone</dt><dd>{}</dd>\n</dl>\n</section>\n",
             esc(pr_common::VERSION),
             esc(&self.config.data_dir.display().to_string()),
             esc(&self.config.timezone),
         );
-        self.page(s, "Dashboard", "dashboard", body)
+        let refresh = runs.iter().any(|r| r.status.is_active()).then_some(5);
+        self.page_with(
+            s,
+            Page { title: "Dashboard".into(), nav: "dashboard", refresh, body, ..Page::default() },
+        )
     }
 
     fn settings(&self, s: &Session) -> Response {

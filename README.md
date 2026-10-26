@@ -23,7 +23,7 @@ model, and the stage plan.
 | 1 | libcrypto FFI, crypto wrappers, common helpers | done |
 | 2 | HTTP server, auth, UI shell | done |
 | 3 | Store, keystore, secrets/inventory/repository pages | done |
-| 4 | Run engine, templates, run logs | planned |
+| 4 | Run engine, templates, run logs | done |
 | 5 | Scheduler | planned |
 | 6 | Production image | planned |
 | 7 | ansible_playbooks role integration | planned |

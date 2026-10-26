@@ -198,3 +198,85 @@ impl Record for Repository {
         })
     }
 }
+
+/// A playbook run definition: what to run, against which inventory, with
+/// which secrets and options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Template {
+    pub id: String,
+    pub name: String,
+    pub repository: String,
+    /// The playbook's path inside the repository, e.g. "update_homelab_vms.yml".
+    pub playbook: String,
+    pub inventory: String,
+    /// Vault password secret ids; each becomes one --vault-id.
+    pub vault_secrets: Vec<String>,
+    /// The SSH key secret ansible connects to hosts with, or "".
+    pub ssh_key: String,
+    pub limit: String,
+    pub tags: String,
+    pub skip_tags: String,
+    pub check_mode: bool,
+    pub diff: bool,
+    /// 0-4: the number of -v flags.
+    pub verbosity: i64,
+    pub timeout_minutes: i64,
+    pub created: i64,
+    pub updated: i64,
+}
+
+impl Record for Template {
+    const FILE: &'static str = "templates.json";
+    const NOUN: &'static str = "template";
+    const BLOB_KIND: Option<&'static str> = None;
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn write_json(&self, out: &mut String) {
+        Obj::new(out)
+            .str("id", &self.id)
+            .str("name", &self.name)
+            .str("repository", &self.repository)
+            .str("playbook", &self.playbook)
+            .str("inventory", &self.inventory)
+            .strs("vault_secrets", &self.vault_secrets)
+            .str("ssh_key", &self.ssh_key)
+            .str("limit", &self.limit)
+            .str("tags", &self.tags)
+            .str("skip_tags", &self.skip_tags)
+            .bool("check_mode", self.check_mode)
+            .bool("diff", self.diff)
+            .int("verbosity", self.verbosity)
+            .int("timeout_minutes", self.timeout_minutes)
+            .int("created", self.created)
+            .int("updated", self.updated)
+            .end();
+    }
+
+    fn read_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            id: jsonw::str(v, "id")?,
+            name: jsonw::str(v, "name")?,
+            repository: jsonw::str(v, "repository")?,
+            playbook: jsonw::str(v, "playbook")?,
+            inventory: jsonw::str(v, "inventory")?,
+            vault_secrets: jsonw::strs(v, "vault_secrets")?,
+            ssh_key: jsonw::str(v, "ssh_key")?,
+            limit: jsonw::str(v, "limit")?,
+            tags: jsonw::str(v, "tags")?,
+            skip_tags: jsonw::str(v, "skip_tags")?,
+            check_mode: jsonw::bool(v, "check_mode")?,
+            diff: jsonw::bool(v, "diff")?,
+            verbosity: jsonw::int(v, "verbosity")?,
+            timeout_minutes: jsonw::int(v, "timeout_minutes")?,
+            created: jsonw::int(v, "created")?,
+            updated: jsonw::int(v, "updated")?,
+        })
+    }
+}

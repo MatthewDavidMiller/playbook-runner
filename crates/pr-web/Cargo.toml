@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 pr-common = { path = "../pr-common" }
 pr-crypto = { path = "../pr-crypto" }
+pr-runner = { path = "../pr-runner" }
 pr-store = { path = "../pr-store" }
 
 [lints]

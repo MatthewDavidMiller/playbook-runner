@@ -11,6 +11,7 @@
 //! | `PR_SECURE_COOKIES` | `true` | `false` only for plain-HTTP development |
 //! | `PR_SESSION_HOURS` | `12` | Session lifetime |
 //! | `PR_TIMEZONE` | `UTC` | Zone schedules are written in, e.g. `America/New_York` |
+//! | `PR_KEEP_RUNS` | `500` | Finished runs kept before the oldest are deleted |
 
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -29,6 +30,7 @@ pub struct Config {
     pub secure_cookies: bool,
     pub session_seconds: u64,
     pub timezone: String,
+    pub keep_runs: usize,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -61,6 +63,13 @@ impl Config {
                 .ok_or_else(|| Error::new("PR_SESSION_HOURS must be 1-720"))?,
         };
         let timezone = var("PR_TIMEZONE").unwrap_or_else(|| "UTC".to_owned());
+        let keep_runs = match var("PR_KEEP_RUNS") {
+            None => 500,
+            Some(n) => pr_common::buf::parse_u64(n.as_bytes(), 100_000)
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|&n| n >= 10)
+                .ok_or_else(|| Error::new("PR_KEEP_RUNS must be 10-100000"))?,
+        };
         Ok(Self {
             listen,
             data_dir: var("PR_DATA_DIR")
@@ -75,6 +84,7 @@ impl Config {
             secure_cookies,
             session_seconds: hours * 3600,
             timezone,
+            keep_runs,
         })
     }
 }

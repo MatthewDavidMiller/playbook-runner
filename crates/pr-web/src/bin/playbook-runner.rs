@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use pr_common::{Error, Result, fsio};
 use pr_crypto::MasterKey;
+use pr_runner::{ExecConfig, Runner};
 use pr_store::Store;
 use pr_web::app::App;
 use pr_web::auth::Auth;
@@ -39,7 +40,14 @@ fn serve() -> Result<()> {
     fsio::mkdir_all(&config.data_dir, 0o700)?;
     let master = load_master_key(&config)?;
     let web_key = master.derive("web").map_err(|_| Error::new("key derivation failed"))?;
-    let store = Store::open(&config.data_dir, &master)?;
+    let store = Arc::new(Store::open(&config.data_dir, &master)?);
+    let exec = ExecConfig {
+        work_dir: config.work_dir.clone(),
+        path: std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_owned()),
+        timezone: config.timezone.clone(),
+    };
+    let runner = Runner::new(Arc::clone(&store), &config.data_dir, exec, config.keep_runs)?;
+    runner.start()?;
     let auth = Auth::new(
         &config.data_dir,
         web_key,
@@ -54,7 +62,7 @@ fn serve() -> Result<()> {
     let listener = TcpListener::bind(config.listen)
         .map_err(|e| Error::new(format!("cannot listen on {}: {e}", config.listen)))?;
     eprintln!("playbook-runner {} listening on {}", pr_common::VERSION, config.listen);
-    let app = Arc::new(App::new(config, auth, store));
+    let app = Arc::new(App::new(config, auth, store, runner));
     pr_web::http::serve(&listener, &app);
     Ok(())
 }

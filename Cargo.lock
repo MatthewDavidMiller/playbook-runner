@@ -19,6 +19,12 @@ dependencies = [
 [[package]]
 name = "pr-runner"
 version = "0.1.0"
+dependencies = [
+ "pr-common",
+ "pr-crypto",
+ "pr-store",
+ "pr-sys",
+]
 
 [[package]]
 name = "pr-sched"
@@ -42,5 +48,6 @@ version = "0.1.0"
 dependencies = [
  "pr-common",
  "pr-crypto",
+ "pr-runner",
  "pr-store",
 ]

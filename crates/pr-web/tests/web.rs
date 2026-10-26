@@ -75,12 +75,20 @@ impl Server {
             secure_cookies: false,
             session_seconds: 3600,
             timezone: "UTC".into(),
+            keep_runs: 50,
         };
         let key = MasterKey::from_hex(&[b'7'; 64]).unwrap();
         let auth = Auth::new(&dir, key.derive("web").unwrap(), 3600, None).unwrap();
         let token = auth.setup_token();
-        let store = pr_store::Store::open(&dir, &key).unwrap();
-        let app = Arc::new(App::new(config, auth, store));
+        let store = Arc::new(pr_store::Store::open(&dir, &key).unwrap());
+        let exec = pr_runner::ExecConfig {
+            work_dir: dir.join("work"),
+            path: std::env::var("PATH").unwrap(),
+            timezone: "UTC".into(),
+        };
+        let runner = pr_runner::Runner::new(Arc::clone(&store), &dir, exec, 50).unwrap();
+        runner.start().unwrap();
+        let app = Arc::new(App::new(config, auth, store, runner));
         thread::spawn(move || pr_web::http::serve(&listener, &app));
         Self { addr, dir, token }
     }
@@ -488,4 +496,103 @@ fn known_hosts_are_validated() {
     let page = s.get("/known-hosts", &[&session]);
     assert!(page.body.contains("line 1 is incomplete"));
     assert!(page.body.contains("github.com ssh-ed25519"), "a rejected save keeps the old file");
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.invalid"])
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+}
+
+#[test]
+fn a_template_runs_from_the_interface() {
+    let s = Server::start("run");
+    let (session, csrf) = s.sign_in(PASSWORD);
+    let repo = s.dir.join("playbooks.git");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(
+        repo.join("hello.yml"),
+        "- hosts: all\n  gather_facts: false\n  tasks:\n    - ansible.builtin.debug:\n        msg: hello-from-the-runner\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "hello"]);
+    let python = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v python3"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let inventory = format!(
+        "all:\n  hosts:\n    localhost:\n      ansible_connection: local\n      ansible_python_interpreter: {}\n",
+        python.trim()
+    );
+    s.post(
+        "/repositories",
+        &[&session],
+        &format!(
+            "csrf_token={csrf}&name=Local&url={}&branch=main&deploy_key=",
+            enc(&repo.to_string_lossy())
+        ),
+    );
+    let repo_id = first_id(&s.get("/repositories", &[&session]), "repositories");
+    s.post(
+        "/inventories",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Local&content={}", enc(&inventory)),
+    );
+    let inv_id = first_id(&s.get("/inventories", &[&session]), "inventories");
+    // An unparseable inventory is refused by ansible-inventory.
+    s.post(
+        "/inventories",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Broken&content={}", enc("all: [x\n")),
+    );
+    assert!(s.get("/inventories", &[&session]).body.contains("could not parse"));
+    let r = s.post(
+        "/templates",
+        &[&session],
+        &format!(
+            "csrf_token={csrf}&name=Hello&repository={repo_id}&playbook=hello.yml&inventory={inv_id}\
+             &ssh_key=&limit=&tags=&skip_tags=&verbosity=0&timeout_minutes=5"
+        ),
+    );
+    assert_eq!(r.header("location"), Some("/templates"));
+    let templates = s.get("/templates", &[&session]);
+    assert!(templates.body.contains("hello.yml"), "{}", templates.body);
+    let tpl_id = first_id(&templates, "templates");
+    let r = s.post(&format!("/templates/{tpl_id}/run"), &[&session], &format!("csrf_token={csrf}"));
+    let location = r.header("location").unwrap().to_owned();
+    assert!(location.starts_with("/runs/"));
+    let start = std::time::Instant::now();
+    let page = loop {
+        let page = s.get(&location, &[&session]);
+        if !page.body.contains("status-heading\">running<")
+            && !page.body.contains("status-heading\">queued<")
+        {
+            break page;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(120));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
+    assert!(page.body.contains("<h2 id=\"status-heading\">succeeded</h2>"), "{}", page.body);
+    assert!(page.body.contains("hello-from-the-runner"));
+    assert!(!page.body.contains("http-equiv=\"refresh\""), "a finished run stops refreshing");
+    let log = s.get(&format!("{location}/log"), &[&session]);
+    assert_eq!(log.header("content-type"), Some("text/plain; charset=utf-8"));
+    assert!(log.body.contains("hello-from-the-runner"));
+    // The inventory is in use now and cannot be deleted.
+    s.post(&format!("/inventories/{inv_id}/delete"), &[&session], &format!("csrf_token={csrf}"));
+    assert!(s.get("/inventories", &[&session]).body.contains("is used by template"));
+    assert!(s.get("/", &[&session]).body.contains("Hello"));
 }

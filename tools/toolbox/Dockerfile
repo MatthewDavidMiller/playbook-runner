@@ -21,9 +21,12 @@ SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 # drives. openssl-dev and openssl-libs-static are the libcrypto pr-sys binds,
 # linked statically into the shipped binary. coreutils, findutils, gawk,
 # grep, and sed replace busybox's applets with the GNU ones the scripts are
-# written against. git, openssh-client, and python3 are what the run-engine
-# tests drive ansible-playbook through.
+# written against. ansible-core, git, and openssh-client are what the
+# run-engine tests drive: a real ansible-playbook against localhost, a real
+# git clone, and a real ssh-agent. The shipped image pins ansible-core
+# separately (Containerfile); the toolbox only needs a working one.
 RUN apk add --no-cache \
+        ansible-core \
         bash \
         build-base \
         coreutils \

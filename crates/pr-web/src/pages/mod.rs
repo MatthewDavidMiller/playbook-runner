@@ -4,29 +4,18 @@
 pub mod inventories;
 pub mod known_hosts;
 pub mod repositories;
+pub mod runs;
 pub mod secrets;
+pub mod templates;
 
-use pr_common::{Result, timefmt};
+use pr_common::timefmt;
 
 use crate::app::App;
 
 impl App {
-    // Templates arrive in Stage 4; until then nothing references a record.
-    pub fn template_users_of_secret(&self, _id: &str) -> Vec<String> {
+    // Schedules arrive in Stage 5; until then nothing references a template.
+    pub fn schedule_users_of_template(&self, _id: &str) -> Vec<String> {
         Vec::new()
-    }
-
-    pub fn template_users_of_inventory(&self, _id: &str) -> Vec<String> {
-        Vec::new()
-    }
-
-    pub fn template_users_of_repository(&self, _id: &str) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Checks that ansible can parse an inventory (Stage 4).
-    pub fn check_inventory(&self, _content: &str) -> Result<()> {
-        Ok(())
     }
 }
 
