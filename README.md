@@ -26,8 +26,8 @@ model, and the stage plan.
 | 4 | Run engine, templates, run logs | done |
 | 5 | Scheduler | done |
 | 6 | Production image | done |
-| 7 | ansible_playbooks role integration | planned |
-| 8 | Cutover from Semaphore | planned |
+| 7 | ansible_playbooks role integration | done (ansible_playbooks branch `playbook-runner`) |
+| 8 | Cutover from Semaphore | waiting on release, lock, and a weekly cycle |
 
 ## Build and test
 
