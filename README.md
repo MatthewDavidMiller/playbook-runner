@@ -24,7 +24,7 @@ model, and the stage plan.
 | 2 | HTTP server, auth, UI shell | done |
 | 3 | Store, keystore, secrets/inventory/repository pages | done |
 | 4 | Run engine, templates, run logs | done |
-| 5 | Scheduler | planned |
+| 5 | Scheduler | done |
 | 6 | Production image | planned |
 | 7 | ansible_playbooks role integration | planned |
 | 8 | Cutover from Semaphore | planned |

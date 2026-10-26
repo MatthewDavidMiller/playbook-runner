@@ -5,26 +5,30 @@ pub mod inventories;
 pub mod known_hosts;
 pub mod repositories;
 pub mod runs;
+pub mod schedules;
 pub mod secrets;
 pub mod templates;
 
+use std::sync::OnceLock;
+
 use pr_common::timefmt;
+use pr_sched::Zone;
 
-use crate::app::App;
+static ZONE: OnceLock<Zone> = OnceLock::new();
 
-impl App {
-    // Schedules arrive in Stage 5; until then nothing references a template.
-    pub fn schedule_users_of_template(&self, _id: &str) -> Vec<String> {
-        Vec::new()
-    }
+/// Sets the zone every page shows times in (once, at startup).
+pub fn set_zone(zone: Zone) {
+    let _ = ZONE.set(zone);
 }
 
-/// "2026-10-25 21:04 UTC" for a Unix time.
+/// The display and scheduling zone; UTC until [`set_zone`] is called.
+pub fn zone() -> &'static Zone {
+    ZONE.get_or_init(Zone::utc)
+}
+
+/// "2026-10-25 21:04 EDT" for a Unix time, in the server's zone.
 pub fn time(epoch: i64) -> String {
-    let days = epoch.div_euclid(86_400);
-    let secs = epoch.rem_euclid(86_400);
-    let (y, m, d) = timefmt::civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", secs / 3600, secs % 3600 / 60)
+    zone().format(epoch)
 }
 
 pub fn now() -> i64 {

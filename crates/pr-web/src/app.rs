@@ -192,6 +192,8 @@ impl App {
             ["known-hosts"] => self.known_hosts_page(s),
             ["templates"] => self.templates_page(s),
             ["templates", id] => return self.template_page(s, id),
+            ["schedules"] => self.schedules_page(s),
+            ["schedules", id] => return self.schedule_page(s, id),
             ["runs"] => self.runs_page(s),
             ["runs", n] => return self.run_page(s, n),
             ["runs", n, "log"] => return self.run_log_download(n),
@@ -228,6 +230,9 @@ impl App {
             ["templates", id, "run"] => return self.template_run(s, id, false),
             ["templates", id, "check"] => return self.template_run(s, id, true),
             ["runs", n, "cancel"] => return self.run_cancel(s, n),
+            ["schedules"] => self.schedule_create(s, form),
+            ["schedules", id] => return self.schedule_update(s, id, form),
+            ["schedules", id, "delete"] => return self.schedule_delete(s, id),
             _ => return None,
         })
     }
@@ -251,6 +256,7 @@ impl App {
         body.push_str(&crate::pages::card("recent", "Recent runs"));
         body.push_str(&self.runs_table(&runs));
         body.push_str("<p><a href=\"/runs\">All runs</a> · <a href=\"/templates\">Run a template</a></p>\n</section>\n");
+        body.push_str(&self.dashboard_schedules());
         body.push_str(&crate::pages::card("about", "This instance"));
         let _ = write!(
             body,

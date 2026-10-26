@@ -302,3 +302,40 @@ fn the_inventory_check_rejects_unparseable_files() {
     let err = f.runner.check_inventory("all: [unclosed\n").unwrap_err();
     assert!(err.message().contains("could not parse"), "{err}");
 }
+
+#[test]
+fn the_scheduler_queues_due_runs_once_and_skips_busy_templates() {
+    use pr_runner::scheduler::{next_run, tick};
+    use pr_store::Schedule;
+    let f = Fixture::new("schedule");
+    let slow = f.template("slow.yml", 10);
+    let id = pr_store::new_id().unwrap();
+    let schedule = Schedule {
+        id: id.clone(),
+        name: "Every minute".into(),
+        template: slow.clone(),
+        cron: "* * * * *".into(),
+        enabled: true,
+        check_mode: false,
+        created: 1,
+        updated: 1,
+    };
+    f.store.put(schedule.clone()).unwrap();
+    let zone = pr_sched::Zone::utc();
+    let now = pr_common::timefmt::unix_seconds();
+    assert!(next_run(&schedule, &zone, now).is_some_and(|n| n > now && n <= now + 60));
+    // Nothing is due in an interval with no minute boundary.
+    let boundary = now - now.rem_euclid(60);
+    assert!(tick(&f.runner, &f.store, &zone, boundary + 1, boundary + 30).is_empty());
+    let queued = tick(&f.runner, &f.store, &zone, now - 120, now);
+    assert_eq!(queued.len(), 1);
+    let run = f.runner.runs().get(queued[0]).unwrap().unwrap();
+    assert_eq!(run.trigger, format!("schedule:{id}"));
+    // While that run is active, the next occurrence is skipped.
+    assert!(tick(&f.runner, &f.store, &zone, now - 120, now).is_empty());
+    f.runner.cancel(queued[0]).unwrap();
+    f.wait(queued[0], |s| !s.is_active());
+    // A disabled schedule never fires.
+    f.store.put(Schedule { enabled: false, ..schedule }).unwrap();
+    assert!(tick(&f.runner, &f.store, &zone, now - 120, now).is_empty());
+}

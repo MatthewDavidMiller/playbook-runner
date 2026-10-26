@@ -76,6 +76,7 @@ impl Server {
             session_seconds: 3600,
             timezone: "UTC".into(),
             keep_runs: 50,
+            zoneinfo_dir: "/usr/share/zoneinfo".into(),
         };
         let key = MasterKey::from_hex(&[b'7'; 64]).unwrap();
         let auth = Auth::new(&dir, key.derive("web").unwrap(), 3600, None).unwrap();
@@ -595,4 +596,64 @@ fn a_template_runs_from_the_interface() {
     s.post(&format!("/inventories/{inv_id}/delete"), &[&session], &format!("csrf_token={csrf}"));
     assert!(s.get("/inventories", &[&session]).body.contains("is used by template"));
     assert!(s.get("/", &[&session]).body.contains("Hello"));
+}
+
+#[test]
+fn schedules_validate_cron_and_protect_their_template() {
+    let s = Server::start("schedules");
+    let (session, csrf) = s.sign_in(PASSWORD);
+    // A template needs a repository and an inventory.
+    s.post(
+        "/repositories",
+        &[&session],
+        &format!("csrf_token={csrf}&name=R&url={}&branch=main", enc("git@github.com:o/r.git")),
+    );
+    let repo_id = first_id(&s.get("/repositories", &[&session]), "repositories");
+    s.post(
+        "/inventories",
+        &[&session],
+        &format!("csrf_token={csrf}&name=I&content={}", enc("all:\n  hosts: {}\n")),
+    );
+    let inv_id = first_id(&s.get("/inventories", &[&session]), "inventories");
+    s.post(
+        "/templates",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Weekly&repository={repo_id}&playbook=site.yml&inventory={inv_id}&verbosity=0&timeout_minutes=60"),
+    );
+    let tpl_id = first_id(&s.get("/templates", &[&session]), "templates");
+    s.post(
+        "/schedules",
+        &[&session],
+        &format!(
+            "csrf_token={csrf}&name=Bad&template={tpl_id}&cron={}&enabled=1",
+            enc("61 * * * *")
+        ),
+    );
+    assert!(s.get("/schedules", &[&session]).body.contains("is not a five-field cron expression"));
+    s.post(
+        "/schedules",
+        &[&session],
+        &format!(
+            "csrf_token={csrf}&name=Never&template={tpl_id}&cron={}&enabled=1",
+            enc("0 0 31 2 *")
+        ),
+    );
+    assert!(s.get("/schedules", &[&session]).body.contains("never fires"));
+    s.post(
+        "/schedules",
+        &[&session],
+        &format!(
+            "csrf_token={csrf}&name=Sunday+patching&template={tpl_id}&cron={}&enabled=1",
+            enc("0 4 * * sun")
+        ),
+    );
+    let page = s.get("/schedules", &[&session]);
+    assert!(page.body.contains("Sunday patching"));
+    assert!(page.body.contains(" 04:00 UTC"), "the next run is shown");
+    assert!(s.get("/", &[&session]).body.contains("Sunday patching"), "the dashboard lists it");
+    // The schedule's template cannot be deleted out from under it.
+    s.post(&format!("/templates/{tpl_id}/delete"), &[&session], &format!("csrf_token={csrf}"));
+    assert!(
+        s.get(&format!("/templates/{tpl_id}"), &[&session]).body.contains("is used by schedule")
+    );
 }

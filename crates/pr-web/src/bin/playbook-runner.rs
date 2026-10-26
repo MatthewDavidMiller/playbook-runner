@@ -48,6 +48,9 @@ fn serve() -> Result<()> {
     };
     let runner = Runner::new(Arc::clone(&store), &config.data_dir, exec, config.keep_runs)?;
     runner.start()?;
+    let zone = pr_sched::Zone::load(&config.zoneinfo_dir, &config.timezone)?;
+    pr_web::pages::set_zone(zone.clone());
+    pr_runner::scheduler::start(Arc::clone(&runner), Arc::clone(&store), zone)?;
     let auth = Auth::new(
         &config.data_dir,
         web_key,

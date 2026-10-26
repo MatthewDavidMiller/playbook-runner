@@ -280,3 +280,57 @@ impl Record for Template {
         })
     }
 }
+
+/// Runs a template on a cron schedule, in the server's time zone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Schedule {
+    pub id: String,
+    pub name: String,
+    pub template: String,
+    pub cron: String,
+    pub enabled: bool,
+    /// Force --check for scheduled runs.
+    pub check_mode: bool,
+    pub created: i64,
+    pub updated: i64,
+}
+
+impl Record for Schedule {
+    const FILE: &'static str = "schedules.json";
+    const NOUN: &'static str = "schedule";
+    const BLOB_KIND: Option<&'static str> = None;
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn write_json(&self, out: &mut String) {
+        Obj::new(out)
+            .str("id", &self.id)
+            .str("name", &self.name)
+            .str("template", &self.template)
+            .str("cron", &self.cron)
+            .bool("enabled", self.enabled)
+            .bool("check_mode", self.check_mode)
+            .int("created", self.created)
+            .int("updated", self.updated)
+            .end();
+    }
+
+    fn read_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            id: jsonw::str(v, "id")?,
+            name: jsonw::str(v, "name")?,
+            template: jsonw::str(v, "template")?,
+            cron: jsonw::str(v, "cron")?,
+            enabled: jsonw::bool(v, "enabled")?,
+            check_mode: jsonw::bool(v, "check_mode")?,
+            created: jsonw::int(v, "created")?,
+            updated: jsonw::int(v, "updated")?,
+        })
+    }
+}

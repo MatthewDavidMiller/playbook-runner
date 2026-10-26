@@ -11,6 +11,7 @@ rust-version.workspace = true
 pr-common = { path = "../pr-common" }
 pr-crypto = { path = "../pr-crypto" }
 pr-runner = { path = "../pr-runner" }
+pr-sched = { path = "../pr-sched" }
 pr-store = { path = "../pr-store" }
 
 [lints]

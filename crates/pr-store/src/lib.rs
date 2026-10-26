@@ -29,7 +29,7 @@ use pr_common::json::{self, Value};
 use pr_common::{Error, Result, fsio, rand};
 use pr_crypto::{MasterKey, SecretBytes, SubKey};
 
-pub use model::{Inventory, Record, Repository, Secret, SecretKind, Template};
+pub use model::{Inventory, Record, Repository, Schedule, Secret, SecretKind, Template};
 
 /// The largest collection file: generous for a homelab's records.
 const COLLECTION_LIMIT: usize = 4 * 1024 * 1024;

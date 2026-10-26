@@ -24,7 +24,8 @@ SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 # written against. ansible-core, git, and openssh-client are what the
 # run-engine tests drive: a real ansible-playbook against localhost, a real
 # git clone, and a real ssh-agent. The shipped image pins ansible-core
-# separately (Containerfile); the toolbox only needs a working one.
+# separately (Containerfile); the toolbox only needs a working one. tzdata is
+# the zone database the scheduler's tests read America/New_York from.
 RUN apk add --no-cache \
         ansible-core \
         bash \
@@ -48,7 +49,8 @@ RUN apk add --no-cache \
         python3 \
         sed \
         shellcheck \
-        tar
+        tar \
+        tzdata
 
 ENV RUSTUP_HOME=/opt/rustup
 ENV PATH="/opt/cargo/bin:${PATH}"

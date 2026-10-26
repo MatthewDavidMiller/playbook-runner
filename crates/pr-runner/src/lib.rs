@@ -12,6 +12,7 @@
 pub mod exec;
 pub mod redact;
 pub mod runs;
+pub mod scheduler;
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};

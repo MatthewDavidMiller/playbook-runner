@@ -11,6 +11,7 @@
 //! | `PR_SECURE_COOKIES` | `true` | `false` only for plain-HTTP development |
 //! | `PR_SESSION_HOURS` | `12` | Session lifetime |
 //! | `PR_TIMEZONE` | `UTC` | Zone schedules are written in, e.g. `America/New_York` |
+//! | `PR_ZONEINFO_DIR` | `/usr/share/zoneinfo` | Where `PR_TIMEZONE` is read from |
 //! | `PR_KEEP_RUNS` | `500` | Finished runs kept before the oldest are deleted |
 
 use std::env;
@@ -31,6 +32,7 @@ pub struct Config {
     pub session_seconds: u64,
     pub timezone: String,
     pub keep_runs: usize,
+    pub zoneinfo_dir: PathBuf,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -85,6 +87,9 @@ impl Config {
             session_seconds: hours * 3600,
             timezone,
             keep_runs,
+            zoneinfo_dir: var("PR_ZONEINFO_DIR")
+                .unwrap_or_else(|| "/usr/share/zoneinfo".into())
+                .into(),
         })
     }
 }
