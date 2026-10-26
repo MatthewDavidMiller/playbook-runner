@@ -24,6 +24,7 @@ use pr_runner::{ExecConfig, Runner, Status};
 use pr_store::{Inventory, Repository, Secret, SecretKind, Store, Template};
 
 const VAULT_PASSWORD: &str = "vault-pass-canary-5772";
+const INVENTORY_PASSWORD: &str = "inventory-pass-canary-9041";
 
 struct Fixture {
     root: PathBuf,
@@ -82,6 +83,8 @@ impl Fixture {
                 "- hosts: all\n  gather_facts: false\n  vars:\n{}\n  tasks:\n\
                  \x20   - ansible.builtin.debug:\n        msg: \"decrypted={{{{ secret_var }}}}\"\n\
                  \x20   - ansible.builtin.debug:\n        msg: \"leak={{{{ leak }}}}\"\n\
+                 \x20   - ansible.builtin.debug:\n        msg: \"become={{{{ ansible_become_pass }}}}\"\n\
+                 \x20   - ansible.builtin.debug:\n        msg: \"blob={{{{ blob }}}}\"\n\
                  \x20   - ansible.builtin.command: ssh-add -l\n      environment:\n        SSH_AUTH_SOCK: \"{{{{ lookup('env', 'SSH_AUTH_SOCK') }}}}\"\n\
                  \x20     changed_when: false\n      register: agent\n\
                  \x20   - ansible.builtin.debug:\n        msg: \"agent={{{{ agent.stdout }}}}\"\n",
@@ -154,8 +157,9 @@ impl Fixture {
         )
         .unwrap();
         let inventory = format!(
-            "all:\n  hosts:\n    localhost:\n      ansible_connection: local\n      ansible_python_interpreter: {}\n  vars:\n    leak: \"{VAULT_PASSWORD}\"\n",
-            python.trim()
+            "all:\n  hosts:\n    localhost:\n      ansible_connection: local\n      ansible_python_interpreter: {}\n  vars:\n    leak: \"{VAULT_PASSWORD}\"\n    ansible_become_pass: \"{INVENTORY_PASSWORD}\"\n    blob: \"{}\"\n",
+            python.trim(),
+            ssh_key.private.replace('\n', "\\n")
         );
         store.put_blob("inventory", &inventory_id, inventory.as_bytes()).unwrap();
         store
@@ -252,6 +256,16 @@ fn a_run_decrypts_through_the_pipe_uses_the_agent_and_masks_secrets() {
     assert!(log.contains("decrypted=plain-value-from-vault"), "{log}");
     assert!(log.contains("leak=********"), "{log}");
     assert!(!log.contains(VAULT_PASSWORD), "{log}");
+    // Inventory values that look like secrets and the lines of the SSH key
+    // are masked even when a playbook prints them.
+    assert!(log.contains("become=********"), "{log}");
+    assert!(!log.contains(INVENTORY_PASSWORD), "{log}");
+    assert!(log.contains("blob="), "{log}");
+    assert!(!log.contains("b3BlbnNzaC1rZXktdjE"), "the SSH key body reached the log: {log}");
+    // On disk the log is sealed.
+    let raw = fs::read(f.root.join("data/runs").join(format!("{}.log", run.number))).unwrap();
+    assert!(raw.starts_with(b"PRL1"));
+    assert!(!String::from_utf8_lossy(&raw).contains("decrypted="));
     assert!(log.contains(&f.key_fingerprint), "{log}");
     assert!(log.contains("--vault-id=default@/dev/fd/200"));
     // The scratch directory is gone, and with it the decrypted inventory.

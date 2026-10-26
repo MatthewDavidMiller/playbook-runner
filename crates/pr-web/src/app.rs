@@ -197,7 +197,7 @@ impl App {
             ["schedules"] => self.schedules_page(s),
             ["schedules", id] => return self.schedule_page(s, id),
             ["runs"] => self.runs_page(s),
-            ["runs", n] => return self.run_page(s, n),
+            ["runs", n] => return self.run_page(s, n, req),
             ["runs", n, "log"] => return self.run_log_download(n),
             [section] if html::NAV.iter().any(|(_, _, key)| key == section) => {
                 self.placeholder(s, section)

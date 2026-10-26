@@ -36,6 +36,18 @@ pub fn vault_id(s: &str) -> Result<String> {
     Ok(s.to_owned())
 }
 
+/// Whether a git URL carries a credential: any user information on an
+/// `https://` URL (a token is often the "user name"), or a password on an
+/// `ssh://` URL. A plain `git@host` user name is not a credential.
+pub fn url_has_credentials(url: &str) -> bool {
+    let Some((scheme, rest)) = url.trim().split_once("://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let Some((userinfo, _)) = authority.rsplit_once('@') else { return false };
+    scheme.eq_ignore_ascii_case("https")
+        || scheme.eq_ignore_ascii_case("http")
+        || userinfo.contains(':')
+}
+
 /// A git remote: `ssh://`, `https://`, scp-style `user@host:path`, or an
 /// absolute local path (for testing). Transport helpers (`ext::`, `fd::`)
 /// and anything that could parse as an option are refused.
@@ -49,6 +61,13 @@ pub fn git_url(s: &str) -> Result<String> {
         && s.split_once(':').is_some_and(|(host, path)| {
             host.contains('@') && !host.contains('/') && !path.is_empty()
         });
+    if url_has_credentials(s) {
+        return fail(
+            "Do not put a token or password in the URL; it would be stored with the repository \
+             record and written to run logs. For a private repository use an ssh:// or \
+             git@host:path URL with a deploy key secret.",
+        );
+    }
     let ok = s.starts_with("ssh://") || s.starts_with("https://") || s.starts_with('/') || scp_like;
     if !ok {
         return fail("Use an ssh://, https://, or user@host:path git URL.");
@@ -177,6 +196,29 @@ pub fn known_hosts(s: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_in_git_urls_are_refused() {
+        for bad in [
+            "https://token@github.com/o/r.git",
+            "https://user:pass@github.com/o/r.git",
+            "https://x-access-token:abc@host/o/r",
+            "ssh://git:secret@host/o/r.git",
+        ] {
+            assert!(url_has_credentials(bad), "{bad}");
+            assert!(git_url(bad).is_err(), "{bad}");
+        }
+        for fine in [
+            "https://github.com/o/r.git",
+            "https://github.com/o/r@v1.git",
+            "https://host/path?x=a@b",
+            "ssh://git@github.com/o/r.git",
+            "git@github.com:o/r.git",
+        ] {
+            assert!(!url_has_credentials(fine), "{fine}");
+            assert!(git_url(fine).is_ok(), "{fine}");
+        }
+    }
 
     #[test]
     fn git_urls() {

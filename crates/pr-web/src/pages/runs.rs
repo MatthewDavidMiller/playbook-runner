@@ -1,5 +1,6 @@
 //! Runs: the history, one run's live log, and cancellation.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use pr_runner::report::{Report, failed_step};
@@ -7,29 +8,85 @@ use pr_runner::{Run, Status};
 
 use super::{card, now, time};
 use crate::app::{App, Session};
-use crate::html::{self, Page, Tone, esc, status_badge};
-use crate::http::Response;
+use crate::html::{self, Page, Tone, esc, esc_into, status_badge};
+use crate::http::{Request, Response};
 
 /// How much of a log the page shows; the full log is a download.
 const LOG_TAIL: u64 = 1024 * 1024;
 
 /// The log with failure lines marked and anchored as `#log-<line>`.
 fn render_log(log: &str, report: &Report) -> String {
-    let mut out = String::with_capacity(log.len() + 1024);
+    let failing: HashSet<usize> = report.failures.iter().map(|f| f.line).collect();
+    let mut out = String::with_capacity(log.len() + log.len() / 8 + 1024);
     for (i, line) in log.lines().enumerate() {
-        if report.failures.iter().any(|f| f.line == i) {
+        if failing.contains(&i) {
             // display: block ends the line itself; a newline would add a blank one.
-            let _ = write!(out, "<span class=\"log-failure\" id=\"log-{i}\">{}</span>", esc(line));
+            let _ = write!(out, "<span class=\"log-failure\" id=\"log-{i}\">");
+            esc_into(&mut out, line);
+            out.push_str("</span>");
         } else if line.starts_with("TASK [")
             || line.starts_with("PLAY ")
             || line.starts_with("PLAY RECAP")
         {
-            let _ = writeln!(out, "<span class=\"log-heading\">{}</span>", esc(line));
+            out.push_str("<span class=\"log-heading\">");
+            esc_into(&mut out, line);
+            out.push_str("</span>\n");
         } else {
-            out.push_str(&esc(line));
+            esc_into(&mut out, line);
             out.push('\n');
         }
     }
+    out
+}
+
+/// A link to a run page. `follow` keeps the log scrolled to its end, `live`
+/// keeps the page refreshing; both are on unless the query says `=0`. A
+/// `tick` makes the URL differ from the page's own, so the browser reloads
+/// instead of treating it as a jump within the page, and the fragment lands
+/// on the log.
+fn run_href(number: u64, follow: bool, live: bool, tick: Option<i64>) -> String {
+    let mut query = Vec::new();
+    if !follow {
+        query.push("follow=0".to_owned());
+    }
+    if !live {
+        query.push("live=0".to_owned());
+    }
+    if let Some(t) = tick {
+        query.push(format!("t={t}"));
+    }
+    let mut href = format!("/runs/{number}");
+    if !query.is_empty() {
+        href.push('?');
+        href.push_str(&query.join("&"));
+    }
+    href.push_str("#log-heading");
+    href
+}
+
+/// The controls above the log of a run that is still going.
+fn log_controls(number: u64, follow: bool, live: bool) -> String {
+    let say = match (live, follow) {
+        (true, true) => "Live: the log refreshes every few seconds and stays at its end.",
+        (true, false) => "Live: the log refreshes every few seconds and starts at the top.",
+        (false, _) => "Updates are paused, so you can scroll and select text.",
+    };
+    let button = |href: String, label: &str| {
+        format!("<a class=\"button button-secondary\" href=\"{}\">{label}</a>\n", esc(&href))
+    };
+    let mut out = format!("<p class=\"field-help\">{say}</p>\n<div class=\"button-row\">\n");
+    if live {
+        out.push_str(&button(run_href(number, follow, false, None), "Pause updates"));
+        out.push_str(&if follow {
+            button(run_href(number, false, true, None), "Stop following the end")
+        } else {
+            button(run_href(number, true, true, None), "Follow the end of the log")
+        });
+    } else {
+        out.push_str(&button(run_href(number, follow, true, None), "Resume updates"));
+        out.push_str(&button(run_href(number, follow, false, Some(now())), "Refresh once"));
+    }
+    out.push_str("</div>\n");
     out
 }
 
@@ -154,8 +211,10 @@ impl App {
         )
     }
 
-    pub fn run_page(&self, s: &Session, number: &str) -> Option<Response> {
+    pub fn run_page(&self, s: &Session, number: &str, req: &Request) -> Option<Response> {
         let number: u64 = number.parse().ok()?;
+        let follow = req.query_value("follow") != Some("0");
+        let live = req.query_value("live") != Some("0");
         let r = self.runner.runs().get(number).ok()??;
         let (log, truncated) = self.runner.read_log(number, LOG_TAIL).unwrap_or_default();
         let mut body = format!(
@@ -221,18 +280,27 @@ impl App {
                 r.number
             );
         }
+        if r.status.is_active() {
+            body.push_str(&log_controls(r.number, follow, live));
+        }
+        // The frame scrolls, not the page: with `follow` it is laid out from
+        // the bottom, so each reload opens on the newest output.
         let _ = writeln!(
             body,
-            "<pre class=\"run-log\">{}</pre>\n</section>",
+            "<div class=\"run-log-frame{}\" tabindex=\"0\">\n<pre class=\"run-log\">{}</pre>\n</div>\n</section>",
+            if follow { " follow" } else { "" },
             if log.is_empty() { esc("(no output yet)") } else { render_log(&log, &report) }
         );
-        let refresh = r.status.is_active().then_some(3);
+        let refreshing = r.status.is_active() && live;
+        let refresh = refreshing.then_some(3);
+        let refresh_to = refreshing.then(|| run_href(r.number, follow, true, Some(now())));
         Some(self.page_with(
             s,
             Page {
                 title: format!("Run #{}", r.number),
                 nav: "runs",
                 refresh,
+                refresh_to,
                 body,
                 ..Page::default()
             },
@@ -243,7 +311,7 @@ impl App {
         let number: u64 = number.parse().ok()?;
         self.runner.runs().get(number).ok()??;
         let (log, _) = self.runner.read_log(number, pr_runner::redact::LOG_LIMIT + 4096).ok()?;
-        Some(Response::text(200, &log).with_header(
+        Some(Response::new(200, "text/plain; charset=utf-8", log).with_header(
             "Content-Disposition",
             format!("attachment; filename=\"run-{number}.log\""),
         ))
@@ -261,6 +329,31 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn run_links_keep_the_chosen_mode_and_land_on_the_log() {
+        assert_eq!(run_href(7, true, true, None), "/runs/7#log-heading");
+        assert_eq!(run_href(7, false, true, None), "/runs/7?follow=0#log-heading");
+        assert_eq!(run_href(7, true, false, None), "/runs/7?live=0#log-heading");
+        // A reload differs from the page's own URL, so it is a real reload
+        // and not a jump to the fragment.
+        assert_eq!(run_href(7, true, true, Some(99)), "/runs/7?t=99#log-heading");
+        assert_ne!(run_href(7, true, true, Some(99)), run_href(7, true, true, Some(100)));
+    }
+
+    #[test]
+    fn controls_offer_pause_and_follow_or_resume() {
+        let live = log_controls(7, true, true);
+        assert!(live.contains("Pause updates") && live.contains("Stop following the end"));
+        assert!(live.contains("href=\"/runs/7?live=0#log-heading\""));
+        assert!(live.contains("href=\"/runs/7?follow=0#log-heading\""));
+        assert!(log_controls(7, false, true).contains("Follow the end of the log"));
+        let paused = log_controls(7, true, false);
+        assert!(paused.contains("Resume updates") && paused.contains("Refresh once"));
+        assert!(!paused.contains("Pause updates"));
+    }
+
     #[test]
     fn durations_read_naturally() {
         assert_eq!(super::duration(5), "5s");

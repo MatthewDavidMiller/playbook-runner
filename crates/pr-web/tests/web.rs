@@ -79,9 +79,9 @@ impl Server {
             zoneinfo_dir: "/usr/share/zoneinfo".into(),
         };
         let key = MasterKey::from_hex(&[b'7'; 64]).unwrap();
-        let auth = Auth::new(&dir, key.derive("web").unwrap(), 3600, None).unwrap();
-        let token = auth.setup_token();
         let store = Arc::new(pr_store::Store::open(&dir, &key).unwrap());
+        let auth = Auth::new(&dir, key.derive("web").unwrap(), 3600, None, store.sealer()).unwrap();
+        let token = auth.setup_token();
         let exec = pr_runner::ExecConfig {
             work_dir: dir.join("work"),
             path: std::env::var("PATH").unwrap(),
@@ -869,6 +869,13 @@ fn a_failed_run_explains_where_it_failed() {
     let line =
         page.body.split(&marked).nth(1).map(|rest| rest.split("</span>").next().unwrap_or(""));
     assert!(line.is_some_and(|l| l.contains("FAILED!")), "anchor {anchor} marks {line:?}");
+    // The log sits in a scrolling frame that opens on its end, and a run that
+    // has finished no longer refreshes or offers the live controls.
+    assert!(page.body.contains("<div class=\"run-log-frame follow\""), "{}", page.body);
+    assert!(!page.body.contains("http-equiv=\"refresh\""));
+    assert!(!page.body.contains("Pause updates"));
+    let off = s.get(&format!("{}?follow=0", r.header("location").unwrap()), &[&session]);
+    assert!(off.body.contains("<div class=\"run-log-frame\""));
 }
 
 #[test]
@@ -884,4 +891,75 @@ fn the_about_page_reports_the_toolchain_and_licenses() {
         page.body.contains("ansible-core") && page.body.contains("GNU General Public License v3.0")
     );
     assert!(page.body.contains("<a href=\"/about\" aria-current=\"page\">About</a>"));
+}
+
+/// The files the application itself keeps: the data directory's own files,
+/// its blobs, and the run records and logs (not the test fixtures beside them).
+fn data_files(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for sub in [dir.to_path_buf(), dir.join("blobs"), dir.join("runs")] {
+        for entry in std::fs::read_dir(&sub).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                out.push((path.clone(), std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn everything_the_application_stores_is_sealed() {
+    let s = Server::start("sealed");
+    let (session, csrf) = s.sign_in(PASSWORD);
+    let (repo_id, inv_id) = playbook_fixture(&s, &session, &csrf);
+    s.post(
+        "/templates",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Broken+canary&repository={repo_id}&playbook=plays%2Fbroken.yml&inventory={inv_id}&verbosity=0&timeout_minutes=5"),
+    );
+    let tpl_id = first_id(&s.get("/templates", &[&session]), "templates");
+    let r = s.post(&format!("/templates/{tpl_id}/run"), &[&session], &format!("csrf_token={csrf}"));
+    let location = r.header("location").unwrap().to_owned();
+    let page = finished_run(&s, &session, &location);
+    // The page still shows the run: the log is sealed on disk, not unreadable.
+    assert!(page.body.contains("deliberate-failure"), "{}", page.body);
+
+    let files = data_files(&s.dir);
+    assert!(files.len() >= 8, "{:?}", files.iter().map(|f| &f.0).collect::<Vec<_>>());
+    for (path, bytes) in &files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = String::from_utf8_lossy(bytes);
+        for canary in ["Broken canary", "Fixture", "deliberate-failure", "pbkdf2", "localhost"] {
+            assert!(!text.contains(canary), "{} holds {canary:?}", path.display());
+        }
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("json") | None if name == "admin.password" => {
+                assert!(bytes.starts_with(b"PRF1"), "{name} is not sealed");
+            }
+            Some("json") => assert!(bytes.starts_with(b"PRF1"), "{name} is not sealed"),
+            Some("log") => assert!(bytes.starts_with(b"PRL1"), "{name} is not sealed"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn a_git_url_with_a_credential_is_refused() {
+    let s = Server::start("url-credential");
+    let (session, csrf) = s.sign_in(PASSWORD);
+    for url in ["https://ghp_exampletoken@github.com/o/r.git", "https://u:p@host/o/r.git"] {
+        let r = s.post(
+            "/repositories",
+            &[&session],
+            &format!("csrf_token={csrf}&name=Leaky&url={}&branch=main", enc(url)),
+        );
+        assert_eq!(r.header("location"), Some("/repositories"));
+        let page = s.get("/repositories", &[&session]);
+        assert!(page.body.contains("Do not put a token or password in the URL"), "{}", page.body);
+        assert!(!page.body.contains("Leaky"), "no record was created");
+    }
+    for (_, bytes) in data_files(&s.dir) {
+        assert!(!String::from_utf8_lossy(&bytes).contains("ghp_exampletoken"));
+    }
 }

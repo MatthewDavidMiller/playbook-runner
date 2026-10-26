@@ -18,7 +18,7 @@
 //! 6. Output is copied to the run log with every secret value masked.
 //! 7. The agent is stopped and the directory deleted, whatever happened.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -34,6 +34,8 @@ use pr_common::{Error, Result, fsio};
 use pr_crypto::SecretBytes;
 use pr_store::{Inventory, Repository, Secret, SecretKind, Store, Template};
 use pr_sys::posix::{SIGKILL, SIGTERM, inherit_fds, send_signal};
+
+use pr_store::seallog::LogSink;
 
 use crate::redact::{self, Redactor};
 
@@ -182,8 +184,8 @@ impl Drop for Supervised {
     }
 }
 
-pub(crate) fn log_line(log: &mut File, text: &str) {
-    let _ = writeln!(log, "[playbook-runner] {text}");
+pub(crate) fn log_line(log: &LogSink, text: &str) {
+    log.write(format!("[playbook-runner] {text}\n").as_bytes());
 }
 
 fn quote_for_ssh_command(path: &Path) -> Result<String> {
@@ -210,7 +212,7 @@ fn base_command(program: &str, cfg: &ExecConfig, home: &Path) -> Command {
 /// to the log while it runs.
 fn run_helper(
     mut cmd: Command,
-    log: &File,
+    log: &LogSink,
     redactor: &Redactor,
     deadline: Duration,
     cancel: &AtomicBool,
@@ -222,12 +224,11 @@ fn run_helper(
         .map_err(|e| Error::new(format!("cannot start {}: {e}", cmd.get_program().display())))?;
     // Closes the parent's copies of the write end, so the reader sees EOF.
     drop(cmd);
-    let mut log_copy = log.try_clone()?;
     thread::scope(|scope| {
         let pump = thread::Builder::new()
             .name("helper-log".to_owned())
             .stack_size(THREAD_STACK)
-            .spawn_scoped(scope, move || redact::pump(reader, &mut log_copy, redactor, 0));
+            .spawn_scoped(scope, move || redact::pump(reader, log, redactor, 0));
         let status = supervise(child, deadline, cancel);
         if let Ok(handle) = pump {
             let _ = handle.join();
@@ -269,7 +270,7 @@ pub(crate) fn start_agent(
     cfg: &ExecConfig,
     dir: &Path,
     keys: &[SecretBytes],
-    log: &mut File,
+    log: &LogSink,
 ) -> Result<Option<(Supervised, PathBuf)>> {
     if keys.is_empty() {
         return Ok(None);
@@ -324,10 +325,16 @@ pub(crate) fn clone_repository(
     dir: &Path,
     repo: &Repository,
     socket: Option<&Path>,
-    log: &mut File,
+    log: &LogSink,
     redactor: &Redactor,
     cancel: &AtomicBool,
 ) -> Result<String> {
+    if pr_store::validate::url_has_credentials(&repo.url) {
+        return Err(Error::new(
+            "the repository URL contains a token or password; edit the repository to remove it \
+             and use an ssh:// or git@host:path URL with a deploy key instead",
+        ));
+    }
     let known_hosts = store.known_hosts_path();
     if !known_hosts.exists() {
         fsio::atomic_replace(&known_hosts, b"", 16)?;
@@ -387,7 +394,7 @@ pub fn execute(
     number: u64,
     template_id: &str,
     check_override: bool,
-    log: &mut File,
+    log: &LogSink,
     cancel: &Arc<AtomicBool>,
 ) -> Outcome {
     let mut outcome = Outcome::default();
@@ -407,12 +414,22 @@ fn execute_inner(
     number: u64,
     template_id: &str,
     check_override: bool,
-    log: &mut File,
+    log: &LogSink,
     cancel: &Arc<AtomicBool>,
     outcome: &mut Outcome,
 ) -> Result<()> {
     let inputs = resolve(store, template_id)?;
-    let redactor = Redactor::new(inputs.vaults.iter().map(|(_, p)| p.expose().to_vec()));
+    // Everything the run was given that must not reach the log: vault
+    // passwords, the lines of each SSH key, and secret-looking inventory
+    // values (best effort; see redact::inventory_secrets).
+    let redactor = Redactor::new(
+        inputs
+            .vaults
+            .iter()
+            .map(|(_, p)| p.expose().to_vec())
+            .chain(inputs.keys.iter().flat_map(|k| redact::ssh_key_secrets(k.expose())))
+            .chain(redact::inventory_secrets(inputs.inventory.expose())),
+    );
 
     fsio::mkdir_all(&cfg.work_dir, 0o700)?;
     let dir = cfg.work_dir.join(format!("run-{number}"));
@@ -502,7 +519,6 @@ fn execute_inner(
     drop(mapping);
     drop(vault_fds);
 
-    let mut log_copy = log.try_clone()?;
     let deadline = Duration::from_secs(
         u64::try_from(inputs.template.timeout_minutes.max(1)).unwrap_or(60) * 60,
     );
@@ -510,7 +526,7 @@ fn execute_inner(
         let pump = thread::Builder::new()
             .name("run-log".to_owned())
             .stack_size(THREAD_STACK)
-            .spawn_scoped(scope, || redact::pump(reader, &mut log_copy, &redactor, 0));
+            .spawn_scoped(scope, || redact::pump(reader, log, &redactor, 0));
         let result = supervise(child, deadline, cancel);
         if let Ok(handle) = pump {
             let _ = handle.join();
@@ -551,7 +567,7 @@ fn execute_inner(
 fn check_collections(
     cfg: &ExecConfig,
     dir: &Path,
-    log: &mut File,
+    log: &LogSink,
     redactor: &Redactor,
     cancel: &AtomicBool,
     outcome: &mut Outcome,

@@ -42,7 +42,10 @@ deploy-key secret, last synced playbooks) · Known hosts · Settings (admin pass
 the ansible-core, collections, git, and OpenSSH the image runs, license, third-party notices).
 
 **Data** `/var/lib/playbook-runner/` (0700, non-root uid): JSON records written atomically, encrypted blobs,
-`runs/<id>.log`. No database. That removes the Postgres DB, the user and the backend network.
+`runs/<id>.log`. No database. That removes the Postgres DB, the user and the backend network. Everything in it
+is sealed with the master key except the key check and the public `known_hosts`: the record collections, the run
+records, the run logs, and the admin password hash, as well as the secret and inventory blobs. A copy of the
+directory is ciphertext without the key.
 
 ## Secret handling (best practice within the constraints)
 - **Master key**: 32 random bytes kept in the external inventory and in Vaultwarden. Ansible provisions it as a
@@ -51,13 +54,19 @@ the ansible-core, collections, git, and OpenSSH the image runs, license, third-p
 - **At rest**: AES-256-GCM. The per-purpose key is HKDF-SHA256(master, "playbook-runner v1 <kind>").
   Each write gets a fresh random 96-bit nonce, and AAD = kind + record id + format version, so a ciphertext
   cannot be moved to another record. The header carries a key id so `playbook-runner rekey` can rotate keys.
-  Inventories are encrypted too, since they hold credentials.
+  Inventories are encrypted too, since they hold credentials. Collections, run records, and the admin hash
+  are sealed whole under a second derived key, with the file's name in the authenticated data. Run logs are
+  sealed in records (a few KiB of text each, authenticated with the run number and the record's offset, with a
+  length on both sides so the live tail is read from the end), because they are appended while a run goes and
+  read while it is still running.
 - **Write-only UI**: secrets can be created, replaced and deleted, but never shown again (the page shows name,
   timestamps and the SSH key fingerprint). They are never logged. Plaintext buffers are wiped with `OPENSSL_cleanse`.
 - **At run time**: vault passwords go to ansible through inherited pipes (`--vault-id <label>@/dev/fd/N`),
   never to disk. SSH keys are loaded into a per-run `ssh-agent` with `ssh-add -` from stdin. The inventory is
   decrypted to a 0600 file in a per-run directory on a `noexec` tmpfs and deleted when the run ends. The container
-  has no swap (`--memory-swap` = `--memory`). Known lines are redacted from logs. `StrictHostKeyChecking=yes`
+  has no swap (`--memory-swap` = `--memory`). Known lines are redacted from logs: the vault passwords, each
+  line of the SSH keys, and (best effort, as the project reads no YAML) inventory values whose names look like
+  secrets. A git URL may not carry a token or password; use an ssh URL and a deploy key. `StrictHostKeyChecking=yes`
   with the managed known_hosts.
 - **Web auth**: one admin, PBKDF2-SHA256 at 600k iterations; sessions stored as HMACs, CSRF tokens, constant-time
   compare (port of `omt-web/src/auth.rs`); login throttling. Cookies are `Secure; HttpOnly; SameSite=Strict`; strict CSP.

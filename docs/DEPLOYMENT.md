@@ -117,9 +117,24 @@ Traefik's.
 ## Backups
 
 Back up `/var/lib/playbook-runner` while the server is running; every file is
-replaced atomically, so a copy is always consistent per file. Back up the
-master key separately (Vaultwarden). Restoring is copying the directory back,
-owned by 10001:10001, mode 0700, and starting the server with the same key.
+replaced atomically, so a copy is always consistent per file. Everything in
+it is encrypted with the master key (the secrets and inventories, the
+records, the run records and logs, and the admin password hash), so a backup
+is ciphertext without the key. Back up the master key separately
+(Vaultwarden). Restoring is copying the directory back, owned by
+10001:10001, mode 0700, and starting the server with the same key.
+
+## Upgrading from before 0.3.0
+
+Version 0.3.0 seals the record collections, run records, run logs, and the
+admin password hash, which earlier versions kept as plain text. The first
+start of 0.3.0 seals them in place; nothing needs doing. Older versions
+cannot read sealed files, so take a backup before upgrading if you may want
+to go back. A repository saved with a token in its URL stops working until it
+is edited to an ssh URL with a deploy key (the log names it at startup).
+
+`playbook-runner passwd` now needs `PR_MASTER_KEY_FILE`, because the hash it
+writes is sealed. Running it inside the container, as above, already has it.
 
 ## Ansible collections
 

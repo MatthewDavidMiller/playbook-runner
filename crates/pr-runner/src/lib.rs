@@ -18,9 +18,7 @@ pub mod scheduler;
 pub mod sync;
 
 use std::collections::VecDeque;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -52,7 +50,8 @@ pub struct Runner {
     cfg: ExecConfig,
     queue: Mutex<VecDeque<Job>>,
     wake: Condvar,
-    current: Mutex<Option<(u64, Arc<AtomicBool>)>>,
+    /// The running job: its number, its template, and its cancel flag.
+    current: Mutex<Option<(u64, String, Arc<AtomicBool>)>>,
     keep_runs: usize,
 }
 
@@ -65,7 +64,7 @@ impl Runner {
         cfg: ExecConfig,
         keep_runs: usize,
     ) -> Result<Arc<Self>> {
-        let runs = RunStore::open(data_dir)?;
+        let runs = RunStore::open(data_dir, store.sealer())?;
         let interrupted = runs.interrupt_stale(timefmt::unix_seconds())?;
         if interrupted > 0 {
             eprintln!("playbook-runner: marked {interrupted} unfinished run(s) as interrupted");
@@ -138,9 +137,7 @@ impl Runner {
     /// Whether a run of `template_id` is queued or running.
     pub fn is_active(&self, template_id: &str) -> bool {
         lock(&self.queue).iter().any(|j| j.template_id == template_id)
-            || lock(&self.current).as_ref().is_some_and(|(n, _)| {
-                self.runs.get(*n).ok().flatten().is_some_and(|r| r.template_id == template_id)
-            })
+            || lock(&self.current).as_ref().is_some_and(|(_, template, _)| template == template_id)
     }
 
     /// Cancels a queued run at once, or asks a running one to stop.
@@ -159,7 +156,7 @@ impl Runner {
             }
         }
         match lock(&self.current).as_ref() {
-            Some((n, flag)) if *n == number => {
+            Some((n, _, flag)) if *n == number => {
                 flag.store(true, Ordering::Release);
                 Ok(())
             }
@@ -170,28 +167,7 @@ impl Runner {
     /// The tail of a run's log, at most `max` bytes, and whether earlier
     /// output was left out.
     pub fn read_log(&self, number: u64, max: u64) -> Result<(String, bool)> {
-        let mut file = match File::open(self.runs.log_path(number)) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((String::new(), false));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let len = file.metadata()?.len();
-        let start = len.saturating_sub(max);
-        file.seek(SeekFrom::Start(start))?;
-        let mut buf = vec![0_u8; usize::try_from(len - start).unwrap_or(0)];
-        let mut filled = 0;
-        while filled < buf.len() {
-            match file.read(&mut buf[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        buf.truncate(filled);
-        Ok((String::from_utf8_lossy(&buf).into_owned(), start > 0))
+        self.runs.read_log(number, max)
     }
 
     /// Clones a repository and records the playbooks it contains.
@@ -205,11 +181,18 @@ impl Runner {
         exec::check_inventory(&self.cfg, content)
     }
 
-    fn next_job(&self) -> Job {
+    /// Waits for the next queued job and makes it the current one in the same
+    /// step, while the queue is still locked. Between a job leaving the queue
+    /// and becoming current, a template would look idle, and the scheduler
+    /// could queue it a second time.
+    fn next_job(&self) -> (Job, Arc<AtomicBool>) {
         let mut queue = lock(&self.queue);
         loop {
             if let Some(job) = queue.pop_front() {
-                return job;
+                let cancel = Arc::new(AtomicBool::new(false));
+                *lock(&self.current) =
+                    Some((job.number, job.template_id.clone(), Arc::clone(&cancel)));
+                return (job, cancel);
             }
             queue = self.wake.wait(queue).unwrap_or_else(PoisonError::into_inner);
         }
@@ -217,9 +200,7 @@ impl Runner {
 
     fn work(&self) {
         loop {
-            let job = self.next_job();
-            let cancel = Arc::new(AtomicBool::new(false));
-            *lock(&self.current) = Some((job.number, Arc::clone(&cancel)));
+            let (job, cancel) = self.next_job();
             self.run_job(&job, &cancel);
             *lock(&self.current) = None;
             if let Err(e) = self.runs.prune(self.keep_runs) {
@@ -237,19 +218,14 @@ impl Runner {
             eprintln!("playbook-runner: run {}: {e}", job.number);
             return;
         }
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(self.runs.log_path(job.number));
-        let outcome = match log {
-            Ok(mut log) => exec::execute(
+        let outcome = match self.runs.log_sink(job.number) {
+            Ok(log) => exec::execute(
                 &self.store,
                 &self.cfg,
                 job.number,
                 &job.template_id,
                 job.check,
-                &mut log,
+                &log,
                 cancel,
             ),
             Err(e) => exec::Outcome {

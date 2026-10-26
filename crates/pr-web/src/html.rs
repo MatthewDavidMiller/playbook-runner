@@ -7,17 +7,29 @@ use std::fmt::Write as _;
 /// Escapes text for an HTML element body or a double-quoted attribute.
 pub fn esc(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
+    esc_into(&mut out, text);
     out
+}
+
+/// [`esc`] appended to `out`. Runs of ordinary text are copied whole, so a
+/// large log costs one append per special character rather than one per
+/// character.
+pub fn esc_into(out: &mut String, text: &str) {
+    let mut plain = 0;
+    for (i, b) in text.bytes().enumerate() {
+        let replacement = match b {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' => "&quot;",
+            b'\'' => "&#39;",
+            _ => continue,
+        };
+        out.push_str(&text[plain..i]);
+        out.push_str(replacement);
+        plain = i + 1;
+    }
+    out.push_str(&text[plain..]);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +73,10 @@ pub struct Page {
     pub flashes: Vec<(Tone, String)>,
     /// Seconds after which the page reloads itself (a running job's log).
     pub refresh: Option<u32>,
+    /// Where the reload goes instead of back to the same URL. A different
+    /// query each time makes it a real reload, and a fragment lands on the
+    /// part of the page the reader is following.
+    pub refresh_to: Option<String>,
     /// Extra classes on <main>, e.g. " page-center".
     pub page_class: &'static str,
     /// The page body, already escaped.
@@ -74,11 +90,28 @@ pub fn render(page: &Page) -> String {
     out.push_str(
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"color-scheme\" content=\"dark light\">\n\
-         <link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/favicon.svg\">\n\
-         <link rel=\"stylesheet\" href=\"/static/style.css\">\n",
+         <link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/favicon.svg\">\n",
+    );
+    // The version in the URL lets the stylesheet be cached for an hour and
+    // still be picked up at once after an upgrade.
+    let _ = writeln!(
+        out,
+        "<link rel=\"stylesheet\" href=\"/static/style.css?v={}\">",
+        pr_common::VERSION
     );
     if let Some(seconds) = page.refresh {
-        let _ = writeln!(out, "<meta http-equiv=\"refresh\" content=\"{seconds}\">");
+        match &page.refresh_to {
+            Some(to) => {
+                let _ = writeln!(
+                    out,
+                    "<meta http-equiv=\"refresh\" content=\"{seconds};url={}\">",
+                    esc(to)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "<meta http-equiv=\"refresh\" content=\"{seconds}\">");
+            }
+        }
     }
     out.push_str(
         "</head>\n<body>\n<a class=\"skip-link\" href=\"#main-content\">Skip to main content</a>\n",

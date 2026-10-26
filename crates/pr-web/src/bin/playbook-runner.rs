@@ -4,6 +4,7 @@
 //! playbook-runner [serve]   Run the web interface (the container's command)
 //! playbook-runner gen-key   Print a new 256-bit master key as 64 hex digits
 //! playbook-runner passwd    Set the admin password from one line on stdin
+//!                           (needs PR_MASTER_KEY_FILE: the hash is sealed)
 //! playbook-runner rekey     Re-encrypt the data directory from the key in
 //!                           PR_OLD_MASTER_KEY_FILE to PR_MASTER_KEY_FILE
 //! playbook-runner healthcheck  Exit 0 when the local server answers /healthz
@@ -42,6 +43,7 @@ fn serve() -> Result<()> {
     let master = load_master_key(&config)?;
     let web_key = master.derive("web").map_err(|_| Error::new("key derivation failed"))?;
     let store = Arc::new(Store::open(&config.data_dir, &master)?);
+    warn_about_url_credentials(&store);
     let exec = ExecConfig {
         work_dir: config.work_dir.clone(),
         path: std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_owned()),
@@ -57,6 +59,7 @@ fn serve() -> Result<()> {
         web_key,
         config.session_seconds,
         config.admin_password_file.as_deref(),
+        store.sealer(),
     )?;
     if let Some(token) = auth.setup_token() {
         eprintln!(
@@ -71,6 +74,20 @@ fn serve() -> Result<()> {
     Ok(())
 }
 
+/// Repositories saved before the URL check may carry a token in their URL.
+/// They are not used (a run or sync refuses them); say so at startup.
+fn warn_about_url_credentials(store: &Store) {
+    for repo in store.list::<pr_store::Repository>().unwrap_or_default() {
+        if pr_store::validate::url_has_credentials(&repo.url) {
+            eprintln!(
+                "playbook-runner: repository \"{}\" has a token or password in its URL; it will \
+                 not be used until you edit it to an ssh:// or git@host:path URL with a deploy key",
+                repo.name
+            );
+        }
+    }
+}
+
 fn gen_key() -> Result<()> {
     let key = MasterKey::generate_hex().map_err(|_| Error::new("randomness unavailable"))?;
     let mut out = io::stdout().lock();
@@ -82,6 +99,9 @@ fn gen_key() -> Result<()> {
 fn passwd() -> Result<()> {
     let config = Config::from_env()?;
     fsio::mkdir_all(&config.data_dir, 0o700)?;
+    // The hash is sealed with the master key like the rest of the data
+    // directory, so setting it needs the key.
+    let sealer = pr_store::Sealer::new(&load_master_key(&config)?)?;
     let mut buf = [0_u8; 512];
     let mut len = 0;
     let mut stdin = io::stdin().lock();
@@ -105,7 +125,7 @@ fn passwd() -> Result<()> {
             pr_web::auth::validate_new_password(p.trim_end_matches('\r'))?;
             let mut hash = pr_web::auth::hash_password(p.trim_end_matches('\r'))?;
             hash.push('\n');
-            fsio::atomic_replace(config.data_dir.join("admin.password"), hash.as_bytes(), 512)
+            pr_web::auth::store_password_hash(&config.data_dir, &sealer, &hash)
         });
     pr_crypto::cleanse(&mut buf);
     result?;

@@ -3,11 +3,17 @@
 //!
 //! ```text
 //! <data>/keycheck              which master key this data belongs to
-//! <data>/<collection>.json     one file per record type (no secret values)
+//! <data>/<collection>.json     one file per record type, sealed ("PRF1")
 //! <data>/blobs/<kind>-<id>     AES-256-GCM sealed values: "PRB1" || nonce || ct || tag
-//! <data>/known_hosts           the managed OpenSSH known_hosts file
-//! <data>/runs/                 run records and logs (pr-runner)
+//! <data>/known_hosts           the managed OpenSSH known_hosts file (public keys)
+//! <data>/runs/                 sealed run records and sealed logs (pr-runner)
+//! <data>/admin.password        the sealed admin password hash (pr-web)
 //! ```
+//!
+//! Everything but the key check and the public known_hosts is encrypted, so
+//! a copy of the data directory is ciphertext without the master key. Files
+//! written before collections were sealed are read as plain text and sealed
+//! when the store opens.
 //!
 //! Every write replaces a whole file atomically under one process-wide
 //! lock, so a crash leaves each file either old or new. Collections are
@@ -19,11 +25,14 @@
 
 pub mod jsonw;
 pub mod model;
+pub mod sealed;
+pub mod seallog;
 pub mod validate;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pr_common::json::{self, Value};
 use pr_common::{Error, Result, fsio, rand};
@@ -32,9 +41,12 @@ use pr_crypto::{MasterKey, SecretBytes, SubKey};
 pub use model::{
     Inventory, Record, RepoSnapshot, Repository, Schedule, Secret, SecretKind, Template,
 };
+pub use sealed::Sealer;
 
 /// The largest collection file: generous for a homelab's records.
 const COLLECTION_LIMIT: usize = 4 * 1024 * 1024;
+/// What a sealed collection file may hold: the records plus the sealing.
+const COLLECTION_FILE_LIMIT: usize = COLLECTION_LIMIT + sealed::OVERHEAD;
 /// The largest sealed value: an inventory of 512 KiB plus framing.
 const BLOB_LIMIT: usize = 600 * 1024;
 pub const KNOWN_HOSTS_LIMIT: usize = 64 * 1024;
@@ -45,7 +57,12 @@ const KEY_PURPOSE: &str = "store/v1";
 pub struct Store {
     dir: PathBuf,
     key: SubKey,
+    sealer: Arc<Sealer>,
     lock: Mutex<()>,
+    /// Each collection's plaintext JSON as last read or written. Every
+    /// change goes through this store under `lock`, so the cache is never
+    /// stale and a read costs neither a disk read nor a decryption.
+    cache: Mutex<HashMap<&'static str, Vec<u8>>>,
 }
 
 fn key_check(master: &MasterKey) -> Result<String> {
@@ -81,7 +98,41 @@ impl Store {
             None => fsio::atomic_replace(&check_path, format!("{check}\n").as_bytes(), 256)?,
         }
         let key = master.derive(KEY_PURPOSE).map_err(|_| Error::new("key derivation failed"))?;
-        Ok(Self { dir: dir.to_path_buf(), key, lock: Mutex::new(()) })
+        let store = Self {
+            dir: dir.to_path_buf(),
+            key,
+            sealer: Arc::new(Sealer::new(master)?),
+            lock: Mutex::new(()),
+            cache: Mutex::new(HashMap::new()),
+        };
+        store.seal_existing::<Secret>()?;
+        store.seal_existing::<Inventory>()?;
+        store.seal_existing::<Repository>()?;
+        store.seal_existing::<Template>()?;
+        store.seal_existing::<Schedule>()?;
+        store.seal_existing::<RepoSnapshot>()?;
+        Ok(store)
+    }
+
+    /// The sealer for files other crates keep in the data directory.
+    pub fn sealer(&self) -> Arc<Sealer> {
+        Arc::clone(&self.sealer)
+    }
+
+    /// Seals a collection file written before sealing existed.
+    fn seal_existing<T: Record>(&self) -> Result<()> {
+        let path = self.dir.join(T::FILE);
+        let Some(raw) = fsio::read_bounded(&path, COLLECTION_FILE_LIMIT)? else { return Ok(()) };
+        if Sealer::is_sealed(&raw) {
+            return Ok(());
+        }
+        let _g = self.guard();
+        let items = self.read_collection::<T>()?;
+        self.write_collection(&items)
+    }
+
+    fn collection_label(file: &str) -> String {
+        format!("collection/{file}")
     }
 
     pub fn dir(&self) -> &Path {
@@ -94,10 +145,23 @@ impl Store {
 
     // ------------------------------------------------------- collections
 
+    fn cache(&self) -> MutexGuard<'_, HashMap<&'static str, Vec<u8>>> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn read_collection<T: Record>(&self) -> Result<Vec<T>> {
-        let path = self.dir.join(T::FILE);
-        let Some(text) = fsio::read_bounded(&path, COLLECTION_LIMIT)? else {
-            return Ok(Vec::new());
+        let cached = self.cache().get(T::FILE).cloned();
+        let text = if let Some(text) = cached {
+            text
+        } else {
+            let path = self.dir.join(T::FILE);
+            let Some(raw) = fsio::read_bounded(&path, COLLECTION_FILE_LIMIT)? else {
+                return Ok(Vec::new());
+            };
+            let (plain, _) = self.sealer.open_any(&Self::collection_label(T::FILE), raw)?;
+            let text = plain.expose().to_vec();
+            self.cache().insert(T::FILE, text.clone());
+            text
         };
         let root = json::parse(&text).map_err(|e| Error::new(format!("{}: {e}", T::FILE)))?;
         let items = root
@@ -126,7 +190,13 @@ impl Store {
             item.write_json(&mut out);
         }
         out.push_str("\n]}\n");
-        fsio::atomic_replace(self.dir.join(T::FILE), out.as_bytes(), COLLECTION_LIMIT)
+        if out.len() > COLLECTION_LIMIT {
+            return Err(Error::new("replacement exceeds its size limit"));
+        }
+        let sealed = self.sealer.seal(&Self::collection_label(T::FILE), out.as_bytes())?;
+        fsio::atomic_replace(self.dir.join(T::FILE), &sealed, COLLECTION_FILE_LIMIT)?;
+        self.cache().insert(T::FILE, out.into_bytes());
+        Ok(())
     }
 
     /// Every record of a type, sorted by name.
@@ -234,9 +304,29 @@ impl Store {
     }
 }
 
-/// Re-encrypts every blob from `old` to `new` and moves the key check to
-/// `new`. Run it with the server stopped. It is safe to repeat after an
-/// interruption: a blob that already opens under `new` is left alone.
+/// Moves one sealed (or, from before sealing, plain) file from `old` to
+/// `new`. A file that already opens under `new` is left alone. Returns
+/// whether it changed.
+fn reseal_file(old: &Sealer, new: &Sealer, path: &Path, label: &str, limit: usize) -> Result<bool> {
+    let Some(raw) = fsio::read_bounded(path, limit)? else { return Ok(false) };
+    if Sealer::is_sealed(&raw) && new.open(label, &raw).is_ok() {
+        return Ok(false);
+    }
+    let (plain, _) = old.open_any(label, raw)?;
+    fsio::atomic_replace(path, &new.seal(label, plain.expose())?, limit)?;
+    Ok(true)
+}
+
+/// The run number in `runs/<n>.<extension>`.
+fn run_number(name: &str, extension: &str) -> Option<u64> {
+    name.strip_suffix(extension)?.strip_suffix('.')?.parse().ok()
+}
+
+/// Re-encrypts everything under the data directory from `old` to `new` and
+/// moves the key check to `new`: the blobs, the collections, the run records
+/// and logs, and the admin password hash. Run it with the server stopped. It
+/// is safe to repeat after an interruption: anything that already opens
+/// under `new` is left alone.
 pub fn rekey(dir: &Path, old: &MasterKey, new: &MasterKey) -> Result<usize> {
     let stored = fsio::read_text(dir.join("keycheck"), 256)?.unwrap_or_default();
     let (old_check, new_check) = (key_check(old)?, key_check(new)?);
@@ -268,6 +358,50 @@ pub fn rekey(dir: &Path, old: &MasterKey, new: &MasterKey) -> Result<usize> {
         out.extend_from_slice(&resealed);
         fsio::atomic_replace(&path, &out, BLOB_LIMIT)?;
         converted += 1;
+    }
+
+    let (old_files, new_files) = (Sealer::new(old)?, Sealer::new(new)?);
+    let mut files: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+    files.sort_by_key(fs::DirEntry::file_name);
+    for entry in files {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_file() && name.strip_suffix(".json").is_some() {
+            let label = Store::collection_label(&name);
+            converted += usize::from(reseal_file(
+                &old_files,
+                &new_files,
+                &entry.path(),
+                &label,
+                COLLECTION_FILE_LIMIT,
+            )?);
+        }
+    }
+    converted += usize::from(reseal_file(
+        &old_files,
+        &new_files,
+        &dir.join("admin.password"),
+        "admin/password",
+        4096,
+    )?);
+    if let Ok(runs) = fs::read_dir(dir.join("runs")) {
+        let mut runs: Vec<_> = runs.collect::<std::io::Result<_>>()?;
+        runs.sort_by_key(fs::DirEntry::file_name);
+        for entry in runs {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(n) = run_number(&name, "json") {
+                let label = format!("run/{n}");
+                converted += usize::from(reseal_file(
+                    &old_files,
+                    &new_files,
+                    &entry.path(),
+                    &label,
+                    128 * 1024,
+                )?);
+            } else if let Some(n) = run_number(&name, "log") {
+                converted +=
+                    usize::from(seallog::reseal(&old_files, &new_files, &entry.path(), n)?);
+            }
+        }
     }
     fsio::atomic_replace(dir.join("keycheck"), format!("{new_check}\n").as_bytes(), 256)?;
     Ok(converted)
@@ -340,6 +474,77 @@ mod tests {
         drop(store);
         // The wrong master key is refused at open.
         assert!(Store::open(&dir, &key(b'2')).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn collections_are_sealed_and_plain_ones_from_older_versions_are_upgraded() {
+        let dir = scratch("collections");
+        let store = Store::open(&dir, &key(b'1')).unwrap();
+        let a = new_id().unwrap();
+        store.put(secret(&a, "Canary name")).unwrap();
+        let raw = fs::read(dir.join("secrets.json")).unwrap();
+        assert!(Sealer::is_sealed(&raw));
+        assert!(!raw.windows(6).any(|w| w == b"Canary"));
+        drop(store);
+        // An older version left the collection as plain JSON.
+        let plain = b"{\"version\":1,\"items\":[]}\n";
+        fs::write(dir.join("secrets.json"), plain).unwrap();
+        let store = Store::open(&dir, &key(b'1')).unwrap();
+        assert!(Sealer::is_sealed(&fs::read(dir.join("secrets.json")).unwrap()));
+        assert!(store.list::<Secret>().unwrap().is_empty());
+        // A sealed file copied over another collection is refused.
+        store.put(secret(&a, "Another")).unwrap();
+        fs::copy(dir.join("secrets.json"), dir.join("templates.json")).unwrap();
+        drop(store);
+        let store = Store::open(&dir, &key(b'1')).unwrap();
+        assert!(store.list::<Template>().is_err());
+        assert_eq!(store.list::<Secret>().unwrap().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rekey_also_moves_collections_run_records_logs_and_the_admin_hash() {
+        let dir = scratch("rekey-all");
+        let (old, new) = (key(b'1'), key(b'2'));
+        let store = Store::open(&dir, &old).unwrap();
+        let id = new_id().unwrap();
+        store.put(secret(&id, "Kept")).unwrap();
+        let sealer = store.sealer();
+        fs::create_dir_all(dir.join("runs")).unwrap();
+        fs::write(dir.join("runs/3.json"), sealer.seal("run/3", b"{\"number\":3}").unwrap())
+            .unwrap();
+        fs::write(
+            dir.join("admin.password"),
+            sealer.seal("admin/password", b"pbkdf2:x\n").unwrap(),
+        )
+        .unwrap();
+        let sink =
+            seallog::LogSink::create(Arc::clone(&sealer), &dir.join("runs/3.log"), 3).unwrap();
+        sink.write(b"log line\n");
+        drop(sink);
+        // A plain record and log from before sealing are sealed along the way.
+        fs::write(dir.join("runs/4.json"), b"{\"number\":4}").unwrap();
+        fs::write(dir.join("runs/4.log"), b"plain log\n").unwrap();
+        drop(store);
+
+        assert_eq!(rekey(&dir, &old, &new).unwrap(), 6);
+        assert_eq!(rekey(&dir, &old, &new).unwrap(), 0, "repeatable");
+        let store = Store::open(&dir, &new).unwrap();
+        assert_eq!(store.get::<Secret>(&id).unwrap().unwrap().name, "Kept");
+        let sealer = store.sealer();
+        let read = |name: &str, label: &str| {
+            sealer.open(label, &fs::read(dir.join(name)).unwrap()).unwrap().expose().to_vec()
+        };
+        assert_eq!(read("runs/3.json", "run/3"), b"{\"number\":3}");
+        assert_eq!(read("runs/4.json", "run/4"), b"{\"number\":4}");
+        assert_eq!(read("admin.password", "admin/password"), b"pbkdf2:x\n");
+        let (log, _) =
+            seallog::read_tail(&sealer, &dir.join("runs/3.log"), 3, 100).unwrap().unwrap();
+        assert_eq!(log, b"log line\n");
+        let (log, _) =
+            seallog::read_tail(&sealer, &dir.join("runs/4.log"), 4, 100).unwrap().unwrap();
+        assert_eq!(log, b"plain log\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 

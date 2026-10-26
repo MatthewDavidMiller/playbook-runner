@@ -2,7 +2,8 @@
 //! login throttling.
 //!
 //! The admin password is stored as `pbkdf2:sha256:<iterations>$<salt>$<hex>`
-//! in `<data>/admin.password` (mode 0600). Sessions are random 256-bit
+//! in `<data>/admin.password` (mode 0600), sealed with the master key like
+//! every other file in the data directory. Sessions are random 256-bit
 //! identifiers held only in memory, keyed by HMAC(web key, id), so a restart
 //! signs everyone out and nothing on disk yields a usable cookie. CSRF tokens
 //! are HMAC(web key, "csrf", session id) and are compared in constant time.
@@ -13,11 +14,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use pr_common::{Error, Result, fsio, rand};
 use pr_crypto::{SubKey, cleanse, ct_equal, hex, hmac_sha256, pbkdf2_sha256};
+use pr_store::Sealer;
 
 use crate::html::Tone;
 
@@ -27,7 +29,9 @@ pub const SESSION_COOKIE: &str = "pr_session";
 pub const LOGIN_COOKIE: &str = "pr_login";
 
 const PBKDF2_ITERATIONS: u32 = 600_000;
-const PASSWORD_FILE_LIMIT: usize = 512;
+const PASSWORD_FILE_LIMIT: usize = 512 + pr_store::sealed::OVERHEAD;
+/// The authenticated label of the sealed password file.
+const PASSWORD_LABEL: &str = "admin/password";
 const MAXIMUM_SESSIONS: usize = 64;
 const MAXIMUM_FLASHES: usize = 8;
 /// Failed logins a client may make inside the window before it is locked
@@ -50,6 +54,13 @@ pub fn validate_new_password(password: &str) -> Result<()> {
         return Err(Error::new("The password must not contain control characters"));
     }
     Ok(())
+}
+
+/// Seals `hash_line` (a [`hash_password`] result and a newline) and writes it
+/// as `<data_dir>/admin.password`.
+pub fn store_password_hash(data_dir: &Path, sealer: &Sealer, hash_line: &str) -> Result<()> {
+    let sealed = sealer.seal(PASSWORD_LABEL, hash_line.as_bytes())?;
+    fsio::atomic_replace(data_dir.join("admin.password"), &sealed, PASSWORD_FILE_LIMIT)
 }
 
 /// `pbkdf2:sha256:600000$SALT$DIGEST` for a new password.
@@ -91,6 +102,7 @@ struct Session {
 #[derive(Debug)]
 pub struct Auth {
     password_file: PathBuf,
+    sealer: Arc<Sealer>,
     web_key: SubKey,
     lifetime: Duration,
     sessions: Mutex<HashMap<String, Session>>,
@@ -107,15 +119,24 @@ impl Auth {
         web_key: SubKey,
         lifetime_s: u64,
         seed: Option<&Path>,
+        sealer: Arc<Sealer>,
     ) -> Result<Self> {
         let auth = Self {
             password_file: data_dir.join("admin.password"),
+            sealer,
             web_key,
             lifetime: Duration::from_secs(lifetime_s),
             sessions: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             setup_token: Mutex::new(None),
         };
+        // A hash written before sealing existed is sealed now.
+        if let Some(raw) = fsio::read_bounded(&auth.password_file, PASSWORD_FILE_LIMIT)?
+            && !Sealer::is_sealed(&raw)
+        {
+            let line = String::from_utf8_lossy(&raw).trim().to_owned();
+            store_password_hash(data_dir, &auth.sealer, &format!("{line}\n"))?;
+        }
         if auth.stored_hash()?.is_none() {
             if let Some(seed) = seed {
                 let mut text = fsio::read_text(seed, PASSWORD_FILE_LIMIT)?
@@ -131,8 +152,11 @@ impl Auth {
     }
 
     fn stored_hash(&self) -> Result<Option<String>> {
-        Ok(fsio::read_text(&self.password_file, PASSWORD_FILE_LIMIT)?
-            .map(|t| t.trim().to_owned())
+        let Some(raw) = fsio::read_bounded(&self.password_file, PASSWORD_FILE_LIMIT)? else {
+            return Ok(None);
+        };
+        let (plain, _) = self.sealer.open_any(PASSWORD_LABEL, raw)?;
+        Ok(Some(String::from_utf8_lossy(plain.expose()).trim().to_owned())
             .filter(|t| !t.is_empty()))
     }
 
@@ -156,7 +180,8 @@ impl Auth {
         validate_new_password(password)?;
         let mut line = hash_password(password)?;
         line.push('\n');
-        fsio::atomic_replace(&self.password_file, line.as_bytes(), PASSWORD_FILE_LIMIT)?;
+        let dir = self.password_file.parent().unwrap_or_else(|| Path::new("."));
+        store_password_hash(dir, &self.sealer, &line)?;
         lock(&self.sessions).clear();
         *lock(&self.setup_token) = None;
         Ok(())
@@ -298,6 +323,10 @@ mod tests {
         dir
     }
 
+    fn sealer() -> Arc<Sealer> {
+        Arc::new(Sealer::new(&MasterKey::from_hex(&[b'a'; 64]).unwrap()).unwrap())
+    }
+
     fn key() -> SubKey {
         MasterKey::from_hex(&[b'a'; 64]).unwrap().derive("web").unwrap()
     }
@@ -317,7 +346,7 @@ mod tests {
     #[test]
     fn setup_token_until_a_password_exists() {
         let dir = scratch("setup");
-        let auth = Auth::new(&dir, key(), 3600, None).unwrap();
+        let auth = Auth::new(&dir, key(), 3600, None, sealer()).unwrap();
         assert!(auth.needs_setup());
         let token = auth.setup_token().unwrap();
         assert!(auth.check_setup_token(&token));
@@ -327,7 +356,24 @@ mod tests {
         assert!(!auth.check_setup_token(&token));
         assert!(auth.password_matches("a long enough password"));
         // A restart finds the stored password and offers no setup.
-        assert!(!Auth::new(&dir, key(), 3600, None).unwrap().needs_setup());
+        assert!(!Auth::new(&dir, key(), 3600, None, sealer()).unwrap().needs_setup());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_hash_is_sealed_on_disk_and_a_plain_one_is_upgraded() {
+        let dir = scratch("sealed");
+        let auth = Auth::new(&dir, key(), 3600, None, sealer()).unwrap();
+        auth.set_password("a long enough password").unwrap();
+        let raw = std::fs::read(dir.join("admin.password")).unwrap();
+        assert!(Sealer::is_sealed(&raw));
+        assert!(!raw.windows(6).any(|w| w == b"pbkdf2"));
+        // An install from before sealing has a plain hash file.
+        let hash = hash_password("an older password!").unwrap();
+        std::fs::write(dir.join("admin.password"), format!("{hash}\n")).unwrap();
+        let auth = Auth::new(&dir, key(), 3600, None, sealer()).unwrap();
+        assert!(auth.password_matches("an older password!"));
+        assert!(Sealer::is_sealed(&std::fs::read(dir.join("admin.password")).unwrap()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -336,7 +382,7 @@ mod tests {
         let dir = scratch("seed");
         let seed = dir.join("seed");
         std::fs::write(&seed, "seeded password value\n").unwrap();
-        let auth = Auth::new(&dir, key(), 3600, Some(&seed)).unwrap();
+        let auth = Auth::new(&dir, key(), 3600, Some(&seed), sealer()).unwrap();
         assert!(!auth.needs_setup());
         assert!(auth.password_matches("seeded password value"));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -345,7 +391,7 @@ mod tests {
     #[test]
     fn sessions_csrf_and_password_change() {
         let dir = scratch("sessions");
-        let auth = Auth::new(&dir, key(), 3600, None).unwrap();
+        let auth = Auth::new(&dir, key(), 3600, None, sealer()).unwrap();
         let id = auth.create_session().unwrap();
         assert!(auth.is_valid(&id));
         assert!(!auth.is_valid("nothex"));
@@ -365,7 +411,7 @@ mod tests {
     #[test]
     fn throttling_locks_after_repeated_failures() {
         let dir = scratch("throttle");
-        let auth = Auth::new(&dir, key(), 3600, None).unwrap();
+        let auth = Auth::new(&dir, key(), 3600, None, sealer()).unwrap();
         for _ in 0..FAILURE_LIMIT - 1 {
             auth.record_failure("10.0.0.1");
         }

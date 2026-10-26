@@ -1,13 +1,15 @@
-//! Run records: one JSON file and one log per run under `<data>/runs/`,
-//! numbered from 1.
+//! Run records: one sealed JSON file and one sealed log per run under
+//! `<data>/runs/`, numbered from 1.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pr_common::json::{self, Value};
 use pr_common::{Error, Result, fsio};
+use pr_store::Sealer;
 use pr_store::jsonw::{self, Obj};
+use pr_store::seallog::{self, LogSink};
 
 const RECORD_LIMIT: usize = 64 * 1024;
 
@@ -122,21 +124,57 @@ impl Run {
 #[derive(Debug)]
 pub struct RunStore {
     dir: PathBuf,
+    sealer: Arc<Sealer>,
     lock: Mutex<()>,
 }
 
 impl RunStore {
-    pub fn open(data_dir: &Path) -> Result<Self> {
+    /// Opens the run directory, sealing any record or log that an earlier
+    /// version left in plain text.
+    pub fn open(data_dir: &Path, sealer: Arc<Sealer>) -> Result<Self> {
         let dir = data_dir.join("runs");
         fsio::mkdir_all(&dir, 0o700)?;
-        Ok(Self { dir, lock: Mutex::new(()) })
+        let store = Self { dir, sealer, lock: Mutex::new(()) };
+        for n in store.numbers()? {
+            store.seal_record(n)?;
+            seallog::migrate(&store.sealer, &store.log_path(n), n)?;
+        }
+        Ok(store)
+    }
+
+    /// Seals run `number`'s record if it is still plain text.
+    fn seal_record(&self, number: u64) -> Result<()> {
+        let limit = RECORD_LIMIT + pr_store::sealed::OVERHEAD;
+        match fsio::read_bounded(self.record_path(number), limit)? {
+            Some(raw) if !Sealer::is_sealed(&raw) => {
+                if let Some(run) = self.read(number)? {
+                    self.write(&run)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Opens run `number`'s log for writing.
+    pub fn log_sink(&self, number: u64) -> Result<LogSink> {
+        LogSink::create(Arc::clone(&self.sealer), &self.log_path(number), number)
+    }
+
+    /// The tail of a run's log, at most `max` bytes, and whether earlier
+    /// output was left out.
+    pub fn read_log(&self, number: u64, max: u64) -> Result<(String, bool)> {
+        Ok(seallog::read_tail(&self.sealer, &self.log_path(number), number, max)?
+            .map_or((String::new(), false), |(bytes, cut)| {
+                (String::from_utf8_lossy(&bytes).into_owned(), cut)
+            }))
     }
 
     fn guard(&self) -> MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub fn log_path(&self, number: u64) -> PathBuf {
+    fn log_path(&self, number: u64) -> PathBuf {
         self.dir.join(format!("{number}.log"))
     }
 
@@ -159,10 +197,15 @@ impl RunStore {
     }
 
     fn read(&self, number: u64) -> Result<Option<Run>> {
-        let Some(text) = fsio::read_bounded(self.record_path(number), RECORD_LIMIT)? else {
+        let Some(raw) = fsio::read_bounded(
+            self.record_path(number),
+            RECORD_LIMIT + pr_store::sealed::OVERHEAD,
+        )?
+        else {
             return Ok(None);
         };
-        let v = json::parse(&text).map_err(|e| Error::new(format!("run {number}: {e}")))?;
+        let (text, _) = self.sealer.open_any(&format!("run/{number}"), raw)?;
+        let v = json::parse(text.expose()).map_err(|e| Error::new(format!("run {number}: {e}")))?;
         Run::read_json(&v)
             .map(Some)
             .ok_or_else(|| Error::new(format!("run {number}: malformed record")))
@@ -172,7 +215,12 @@ impl RunStore {
         let mut out = String::new();
         run.write_json(&mut out);
         out.push('\n');
-        fsio::atomic_replace(self.record_path(run.number), out.as_bytes(), RECORD_LIMIT)
+        let sealed = self.sealer.seal(&format!("run/{}", run.number), out.as_bytes())?;
+        fsio::atomic_replace(
+            self.record_path(run.number),
+            &sealed,
+            RECORD_LIMIT + pr_store::sealed::OVERHEAD,
+        )
     }
 
     /// Records a new queued run, assigning the next number.
@@ -267,10 +315,36 @@ mod tests {
     }
 
     #[test]
+    fn records_and_logs_from_before_sealing_are_sealed_when_the_store_opens() {
+        let dir = std::env::temp_dir().join(format!("pr-runs-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("runs")).unwrap();
+        let mut run = sample("t");
+        run.number = 1;
+        run.template_name = "Plain canary".into();
+        let mut text = String::new();
+        run.write_json(&mut text);
+        fs::write(dir.join("runs/1.json"), &text).unwrap();
+        fs::write(dir.join("runs/1.log"), "old log canary\n").unwrap();
+        let sealer =
+            Arc::new(Sealer::new(&pr_crypto::MasterKey::from_hex(&[b'6'; 64]).unwrap()).unwrap());
+        let store = RunStore::open(&dir, sealer).unwrap();
+        assert_eq!(store.get(1).unwrap().unwrap().template_name, "Plain canary");
+        assert_eq!(store.read_log(1, 1 << 20).unwrap(), ("old log canary\n".to_owned(), false));
+        for name in ["1.json", "1.log"] {
+            let raw = fs::read(dir.join("runs").join(name)).unwrap();
+            assert!(!String::from_utf8_lossy(&raw).contains("canary"), "{name} is still plain");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn numbering_updates_interruption_and_pruning() {
         let dir = std::env::temp_dir().join(format!("pr-runs-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let store = RunStore::open(&dir).unwrap();
+        let sealer =
+            Arc::new(Sealer::new(&pr_crypto::MasterKey::from_hex(&[b'4'; 64]).unwrap()).unwrap());
+        let store = RunStore::open(&dir, sealer).unwrap();
         let a = store.create(sample("t")).unwrap();
         let b = store.create(sample("t")).unwrap();
         assert_eq!((a.number, b.number), (1, 2));

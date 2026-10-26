@@ -5,12 +5,12 @@
 //! deleted as soon as the playbooks are listed; only the list and the commit
 //! are kept, as a [`RepoSnapshot`].
 
-use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use pr_common::{Error, Result, fsio, rand, timefmt};
+use pr_store::seallog::{self, LogSink};
 use pr_store::{RepoSnapshot, Repository, Secret, SecretKind, Store};
 
 use crate::exec::{ExecConfig, Scratch, clone_repository, start_agent};
@@ -126,21 +126,22 @@ pub fn sync_repository(
     let scratch = Scratch(dir.clone());
     fsio::mkdir_all(dir.join("home"), 0o700)?;
     let log_path = dir.join("sync.log");
-    let mut log: File =
-        OpenOptions::new().create_new(true).append(true).mode(0o600).open(&log_path)?;
-    let agent = start_agent(cfg, &dir, &keys, &mut log)?;
+    let log = LogSink::create(store.sealer(), &log_path, 0)?;
+    let agent = start_agent(cfg, &dir, &keys, &log)?;
     let socket = agent.as_ref().map(|(_, socket)| socket.as_path());
     let cancel = AtomicBool::new(false);
     let cloned =
-        clone_repository(store, cfg, &dir, &repo, socket, &mut log, &Redactor::new([]), &cancel);
+        clone_repository(store, cfg, &dir, &repo, socket, &log, &Redactor::new([]), &cancel);
     drop(agent);
     let commit = match cloned {
         Ok(commit) => commit,
         Err(e) => {
             // git's own message is the useful part; the runner's lines are not.
-            let detail: Vec<String> = fsio::read_text(&log_path, 64 * 1024)
+            log.flush();
+            let detail: Vec<String> = seallog::read_tail(&store.sealer(), &log_path, 0, 64 * 1024)
                 .ok()
                 .flatten()
+                .map(|(bytes, _)| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default()
                 .lines()
                 .filter(|l| !l.starts_with("[playbook-runner]") && !l.trim().is_empty())

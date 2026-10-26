@@ -269,18 +269,24 @@ enum ReadError {
     Io,
 }
 
-/// Finds the end of the header block: the index just past "\r\n\r\n".
-fn header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+/// Finds the end of the header block: the index just past "\r\n\r\n",
+/// looking only at `buf[from..]` (a caller that already searched the start
+/// passes how far back a terminator could still begin).
+fn header_end(buf: &[u8], from: usize) -> Option<usize> {
+    let tail = buf.get(from..)?;
+    tail.windows(4).position(|w| w == b"\r\n\r\n").map(|i| from + i + 4)
 }
 
 fn read_request(stream: &mut TcpStream, peer: IpAddr) -> Result<Request, ReadError> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 4096];
+    let mut searched = 0;
     let end = loop {
-        if let Some(end) = header_end(&buf) {
+        if let Some(end) = header_end(&buf, searched) {
             break end;
         }
+        // A terminator can straddle the previous read by up to three bytes.
+        searched = buf.len().saturating_sub(3);
         if buf.len() > MAX_HEADER_BYTES {
             return Err(ReadError::Status(431));
         }
