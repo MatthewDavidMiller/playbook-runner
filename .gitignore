@@ -24,3 +24,6 @@ vars.yml
 # Temporary files
 *.tmp
 *.log
+
+# ansible temp files from local test runs (the toolbox user's home is the tree)
+/.ansible/
