@@ -43,6 +43,19 @@ if [[ "${members}" != "${expected}" ]]; then
     exit 1
 fi
 
+echo "== native library allowlist"
+# libcrypto is the one third-party library; pthread is the C library's.
+libraries="$(grep -rhoE 'rustc-link-lib=\{kind\}=[A-Za-z0-9_]+|rustc-link-lib=([a-z]+=)?[A-Za-z0-9_]+' crates --include='*.rs' |
+    sed 's/.*=//' | sort -u)"
+[[ -n "${libraries}" ]] || { echo "ERROR: no linked library found; the pattern no longer matches" >&2; exit 1; }
+while IFS= read -r library; do
+    [[ "${library}" =~ ^(crypto|pthread)$ ]] || { echo "ERROR: unexpected native library ${library}" >&2; exit 1; }
+done <<<"${libraries}"
+if grep -rn '#\[link(' crates --include='*.rs' >/dev/null; then
+    echo "ERROR: link libraries through crates/pr-sys/build.rs, not #[link]" >&2
+    exit 1
+fi
+
 echo "== unsafe allowlist"
 UNSAFE_CRATES=(pr-sys)
 for manifest in crates/*/Cargo.toml; do

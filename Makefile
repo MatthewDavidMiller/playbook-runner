@@ -1,7 +1,7 @@
 # playbook-runner build system
 # Usage: make [target]
 
-.PHONY: help install lint test shell clean
+.PHONY: help install fmt lint test shell clean
 
 # Every gate runs inside the toolbox image, so rootless Podman is the only
 # thing this repository needs from a workstation.
@@ -11,6 +11,7 @@ help:
 	@echo "playbook-runner"
 	@echo ""
 	@echo "  install   Build the toolbox image and install the git hooks (once)"
+	@echo "  fmt       Format the Rust sources"
 	@echo "  lint      shellcheck the scripts and hooks"
 	@echo "  test      The full pre-commit gate: lint, rustfmt, dependency"
 	@echo "            graph, unsafe allowlist, clippy, and the test suites"
@@ -22,6 +23,9 @@ help:
 install:
 	$(TOOLBOX) --build
 	./scripts/setup-hooks.sh
+
+fmt:
+	$(TOOLBOX) cargo fmt --all
 
 lint:
 	$(TOOLBOX) ./scripts/lint.sh
