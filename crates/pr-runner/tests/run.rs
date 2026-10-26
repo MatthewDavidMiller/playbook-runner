@@ -350,3 +350,60 @@ fn the_scheduler_queues_due_runs_once_and_skips_busy_templates() {
     f.store.put(Schedule { enabled: false, ..schedule }).unwrap();
     assert!(tick(&f.runner, &f.store, &zone, now - 120, now).is_empty());
 }
+
+/// Writes `files` into the fixture repository and commits them.
+fn commit(f: &Fixture, files: &[(&str, &str)]) {
+    let repo = f.root.join("repo.git");
+    for (path, content) in files {
+        let path = repo.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "update"]);
+}
+
+#[test]
+fn collection_requirements_are_checked_offline_against_the_image() {
+    let f = Fixture::new("collections");
+    // A repository that pins a collection its own collections_path provides,
+    // standing in for the collections built into the image.
+    commit(
+        &f,
+        &[
+            ("ansible.cfg", "[defaults]\ncollections_path = ./collections\n"),
+            (
+                "collections/ansible_collections/testns/testcoll/galaxy.yml",
+                "namespace: testns\nname: testcoll\nversion: 1.2.3\nreadme: README.md\nauthors: [test]\n",
+            ),
+            (
+                "collections/requirements.yml",
+                "collections:\n  - name: testns.testcoll\n    version: \">=1.0.0,<2.0.0\"\n",
+            ),
+        ],
+    );
+    let template = f.template("site.yml", 10);
+    let run = f.runner.enqueue(&template, "manual", false).unwrap();
+    let done = f.wait(run.number, |s| !s.is_active());
+    let log = f.log(run.number);
+    assert_eq!(done.status, Status::Succeeded, "{log}");
+    assert!(log.contains(
+        "checking the built-in collections against collections/requirements.yml (offline)"
+    ));
+
+    // A requirement the image cannot meet stops the run before ansible-playbook.
+    commit(
+        &f,
+        &[(
+            "collections/requirements.yml",
+            "collections:\n  - name: testns.testcoll\n    version: 2.0.0\n",
+        )],
+    );
+    let run = f.runner.enqueue(&template, "manual", false).unwrap();
+    let done = f.wait(run.number, |s| !s.is_active());
+    let log = f.log(run.number);
+    assert_eq!(done.status, Status::Failed, "{log}");
+    assert!(done.error.contains("do not satisfy collections/requirements.yml"), "{}", done.error);
+    assert!(log.contains("testns.testcoll:2.0.0"), "the resolver's reason is in the log: {log}");
+    assert!(!log.contains("ansible-playbook -i"), "the playbook never started: {log}");
+}

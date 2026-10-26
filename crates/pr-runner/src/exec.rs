@@ -6,6 +6,11 @@
 //!    and the SSH keys are loaded with `ssh-add -` from a pipe.
 //! 3. The repository branch is cloned with host keys checked against the
 //!    managed known_hosts file.
+//!    If the repository declares `collections/requirements.yml`, the
+//!    collections built into the image must satisfy it: `ansible-galaxy
+//!    collection install --offline` resolves it against what is installed,
+//!    nothing is ever downloaded, and its output path is the scratch space. A mismatch fails the run before
+//!    anything executes, rather than running with stale collections.
 //! 4. The inventory is decrypted to a 0600 file.
 //! 5. `ansible-playbook` runs in its own process group with a clean
 //!    environment. Each vault password reaches it on an inherited pipe named
@@ -39,6 +44,10 @@ const MAX_VAULT_SECRETS: usize = 16;
 const TERM_GRACE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(200);
 const GIT_TIMEOUT: Duration = Duration::from_mins(5);
+const COLLECTION_CHECK_TIMEOUT: Duration = Duration::from_mins(2);
+/// Where a repository declares the collections its playbooks need.
+const COLLECTION_REQUIREMENTS: [&str; 2] =
+    ["collections/requirements.yml", "collections/requirements.yaml"];
 const THREAD_STACK: usize = 256 * 1024;
 
 /// What the caller needs to know about a finished run.
@@ -410,6 +419,8 @@ fn execute_inner(
         )));
     }
 
+    check_collections(cfg, &dir, log, &redactor, cancel, outcome)?;
+
     // Inventory.
     let mut inventory_file = OpenOptions::new()
         .write(true)
@@ -503,6 +514,50 @@ fn execute_inner(
     );
     drop(agent);
     drop(scratch);
+    Ok(())
+}
+
+/// Fails the run when the image's built-in collections do not satisfy the
+/// repository's `collections/requirements.yml`. The resolution is
+/// `--offline`, so it only compares; it never reaches Galaxy and installs
+/// nothing. It runs in the clone so the repository's ansible.cfg
+/// `collections_path` applies, exactly as it will for the playbook, but with
+/// `-p` aimed at the run's scratch space: ansible-galaxy creates its output
+/// directory even when there is nothing to install, and that must not be
+/// inside the clone, where it could shadow a configured path.
+fn check_collections(
+    cfg: &ExecConfig,
+    dir: &Path,
+    log: &mut File,
+    redactor: &Redactor,
+    cancel: &AtomicBool,
+    outcome: &mut Outcome,
+) -> Result<()> {
+    let repo = dir.join("repo");
+    let Some(requirements) = COLLECTION_REQUIREMENTS
+        .iter()
+        .find(|r| fs::symlink_metadata(repo.join(r)).is_ok_and(|m| m.is_file()))
+    else {
+        return Ok(());
+    };
+    log_line(log, &format!("checking the built-in collections against {requirements} (offline)"));
+    let mut cmd = base_command("ansible-galaxy", cfg, &dir.join("home"));
+    cmd.args(["collection", "install", "--offline", "-r", requirements, "-p"])
+        .arg(dir.join("galaxy-check"))
+        .current_dir(&repo)
+        .env("ANSIBLE_NOCOLOR", "1")
+        .env("ANSIBLE_LOCAL_TEMP", dir.join("tmp"));
+    let status = run_helper(cmd, log, redactor, COLLECTION_CHECK_TIMEOUT, cancel)?;
+    if cancel.load(Ordering::Acquire) {
+        outcome.cancelled = true;
+        return Err(Error::new("cancelled during the collection check"));
+    }
+    if !status.success() {
+        return Err(Error::new(format!(
+            "the collections built into this playbook-runner image do not satisfy {requirements}; \
+             update runtime/collections.yml in playbook-runner and release a new image"
+        )));
+    }
     Ok(())
 }
 

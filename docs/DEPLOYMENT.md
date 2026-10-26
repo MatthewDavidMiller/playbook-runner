@@ -121,6 +121,26 @@ replaced atomically, so a copy is always consistent per file. Back up the
 master key separately (Vaultwarden). Restoring is copying the directory back,
 owned by 10001:10001, mode 0700, and starting the server with the same key.
 
+## Ansible collections
+
+Collections are built into the image (`runtime/collections.yml`) and are
+never downloaded at run time, so a run needs no access to Ansible Galaxy and
+always uses the reviewed, scanned set. Before each run, if the playbook
+repository has `collections/requirements.yml`, the runner resolves it
+against the built-in collections with
+`ansible-galaxy collection install --offline`. If they do not satisfy it,
+the run fails before anything executes, with the resolver's reason in the
+log:
+
+```text
+the collections built into this playbook-runner image do not satisfy
+collections/requirements.yml; update runtime/collections.yml in
+playbook-runner and release a new image
+```
+
+To change collections, update `runtime/collections.yml` to match the
+playbook repository, `make release`, and pin the new image.
+
 ## Health
 
 `playbook-runner healthcheck` (the image's `HEALTHCHECK`) exits 0 when the

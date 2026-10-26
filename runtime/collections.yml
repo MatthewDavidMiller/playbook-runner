@@ -1,7 +1,11 @@
 # Ansible collections baked into the runtime image at
 # /usr/share/ansible/collections, the second entry of ansible_playbooks'
-# collections_path. These match ansible_playbooks/collections/requirements.yml;
-# keep the two in step.
+# collections_path. Runs never download collections: before each run the
+# runner resolves the repository's collections/requirements.yml against
+# these with `ansible-galaxy collection install --offline` (into the run's
+# scratch space, so nothing lands in the clone) and fails the run
+# if they do not satisfy it. So when ansible_playbooks changes its
+# requirements, update this file to match and release a new image.
 ---
 collections:
   - name: ansible.posix

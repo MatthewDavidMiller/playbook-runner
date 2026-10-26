@@ -4,21 +4,21 @@ version = 4
 
 [[package]]
 name = "pr-common"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pr-sys",
 ]
 
 [[package]]
 name = "pr-crypto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pr-sys",
 ]
 
 [[package]]
 name = "pr-runner"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pr-common",
  "pr-crypto",
@@ -29,14 +29,14 @@ dependencies = [
 
 [[package]]
 name = "pr-sched"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pr-common",
 ]
 
 [[package]]
 name = "pr-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pr-common",
  "pr-crypto",
@@ -44,11 +44,11 @@ dependencies = [
 
 [[package]]
 name = "pr-sys"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "pr-web"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "pr-common",
  "pr-crypto",
