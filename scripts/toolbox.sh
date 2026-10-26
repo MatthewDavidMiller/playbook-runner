@@ -56,7 +56,18 @@ prune_superseded_toolboxes() {
 build_toolbox() {
     local tag="$1"
     echo "=== Building toolbox image ${tag} ===" >&2
-    podman build --format docker -f "${DOCKERFILE}" -t "${tag}" "${PROJECT_ROOT}"
+    # The platform is explicit because the base is pinned by manifest digest,
+    # and Podman resolves a digest to whatever variant it already holds
+    # locally: an arm64 copy pulled by another project would otherwise yield
+    # an emulated arm64 toolbox.
+    local platform
+    case "$(uname -m)" in
+        x86_64 | amd64) platform="linux/amd64" ;;
+        aarch64 | arm64) platform="linux/arm64" ;;
+        *) echo "ERROR: unsupported workstation architecture $(uname -m)" >&2; return 1 ;;
+    esac
+    podman build --format docker --platform "${platform}" \
+        -f "${DOCKERFILE}" -t "${tag}" "${PROJECT_ROOT}"
     prune_superseded_toolboxes "${tag}"
 }
 
