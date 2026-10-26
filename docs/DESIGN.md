@@ -60,11 +60,15 @@ Repositories (git URL, branch, deploy-key secret) · Known hosts · Settings (ad
 
 ## Container image
 Multi-stage `Containerfile`, with both base images pinned by digest:
-- Builder: official `docker.io/library/rust:<ver>-alpine` + `openssl-dev openssl-libs-static`, producing a static musl binary.
+- Builder: the same official Alpine image, with the repository-pinned Rust toolchain installed by the checksum-verified
+  `scripts/install-rust.sh` (rather than trusting a second base image for the compiler) + `openssl-dev openssl-libs-static`,
+  producing a static-pie musl binary with libcrypto linked in.
 - Runtime: official `docker.io/library/alpine:<ver>` + `git openssh-client python3`, with ansible-core installed
   through pip `--require-hashes` into `/opt/venv` and the collections from `ansible_playbooks/collections/requirements.yml`
   baked in. Non-root USER, `--read-only`, `--cap-drop=ALL`, `no-new-privileges`, tmpfs `/tmp` and `/run`.
-- `make release` builds the image, pushes it to private GHCR and creates a GitHub Release (as in rpi-omt-client, no Actions).
+- `make release` builds the image, pushes it to GHCR and creates a GitHub Release (as in rpi-omt-client, no Actions).
+- `make test-image` runs the image with VM1's flags and runs the end-to-end test binaries inside it. See
+  [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Stages (each ends in something we can test)
 

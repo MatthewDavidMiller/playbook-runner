@@ -1,7 +1,7 @@
 # playbook-runner build system
 # Usage: make [target]
 
-.PHONY: help install fmt lint test dev shell clean
+.PHONY: help install fmt lint test test-image image release dev shell clean
 
 # Every gate runs inside the toolbox image, so rootless Podman is the only
 # thing this repository needs from a workstation.
@@ -15,6 +15,10 @@ help:
 	@echo "  lint      shellcheck the scripts and hooks"
 	@echo "  test      The full pre-commit gate: lint, rustfmt, dependency"
 	@echo "            graph, unsafe allowlist, clippy, and the test suites"
+	@echo "  image     Build the runtime image localhost/playbook-runner:dev"
+	@echo "  test-image  Build the image and run it, and the end-to-end tests,"
+	@echo "            with VM1's security flags (slow; pulls nothing new)"
+	@echo "  release   Gate, build, push to GHCR, tag, and create the GitHub release"
 	@echo "  dev       Run the server at http://127.0.0.1:8080 (state in ./data)"
 	@echo "  shell     Interactive shell in the toolbox"
 	@echo "  clean     Remove build output"
@@ -33,6 +37,15 @@ lint:
 
 test:
 	$(TOOLBOX) ./scripts/test-local.sh
+
+image:
+	podman build --format docker --platform linux/amd64 -f Containerfile -t localhost/playbook-runner:dev .
+
+test-image:
+	./scripts/test-image.sh
+
+release:
+	./scripts/release.sh
 
 dev:
 	./scripts/dev-server.sh

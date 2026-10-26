@@ -6,6 +6,7 @@
 //! playbook-runner passwd    Set the admin password from one line on stdin
 //! playbook-runner rekey     Re-encrypt the data directory from the key in
 //!                           PR_OLD_MASTER_KEY_FILE to PR_MASTER_KEY_FILE
+//! playbook-runner healthcheck  Exit 0 when the local server answers /healthz
 //! playbook-runner version   Print the version
 //! ```
 //!
@@ -124,6 +125,23 @@ fn rekey() -> Result<()> {
     Ok(())
 }
 
+/// GET /healthz on the configured listener (loopback for a wildcard).
+fn healthcheck() -> Result<()> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+    let config = Config::from_env()?;
+    let mut addr = config.listen;
+    if addr.ip().is_unspecified() {
+        addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port());
+    }
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+    let mut head = [0_u8; 12];
+    stream.read_exact(&mut head)?;
+    if &head == b"HTTP/1.1 200" { Ok(()) } else { Err(Error::new("unhealthy")) }
+}
+
 fn main() -> ExitCode {
     let command = std::env::args().nth(1).unwrap_or_else(|| "serve".to_owned());
     let result = match command.as_str() {
@@ -131,11 +149,14 @@ fn main() -> ExitCode {
         "gen-key" => gen_key(),
         "passwd" => passwd(),
         "rekey" => rekey(),
+        "healthcheck" => healthcheck(),
         "version" | "--version" => {
             println!("playbook-runner {}", pr_common::VERSION);
             Ok(())
         }
-        _ => Err(Error::new("usage: playbook-runner [serve|gen-key|passwd|rekey|version]")),
+        _ => Err(Error::new(
+            "usage: playbook-runner [serve|gen-key|passwd|rekey|healthcheck|version]",
+        )),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

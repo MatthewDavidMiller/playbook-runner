@@ -25,7 +25,7 @@ model, and the stage plan.
 | 3 | Store, keystore, secrets/inventory/repository pages | done |
 | 4 | Run engine, templates, run logs | done |
 | 5 | Scheduler | done |
-| 6 | Production image | planned |
+| 6 | Production image | done |
 | 7 | ansible_playbooks role integration | planned |
 | 8 | Cutover from Semaphore | planned |
 
@@ -38,10 +38,17 @@ the toolbox image.
 make install   # once: build the toolbox and install the pre-commit hook
 make test      # the full gate
 make dev       # run the server at http://127.0.0.1:8080 (state in ./data)
+make image     # build the runtime image
+make test-image  # run the image, and the end-to-end tests, with VM1's flags
 ```
 
 `make dev` prints a one-time setup token on first start; open
 http://127.0.0.1:8080, enter it, and choose the admin password.
+
+## Deployment
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the container flags, the
+master key, first start, Traefik, and backups.
 
 ## License
 

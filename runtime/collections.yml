@@ -1,0 +1,10 @@
+# Ansible collections baked into the runtime image at
+# /usr/share/ansible/collections, the second entry of ansible_playbooks'
+# collections_path. These match ansible_playbooks/collections/requirements.yml;
+# keep the two in step.
+---
+collections:
+  - name: ansible.posix
+    version: 1.5.4
+  - name: community.general
+    version: 8.3.0
