@@ -30,11 +30,16 @@ release profile copied from `../rpi-omt-client/Cargo.toml`; `Cargo.lock` lists w
 | `pr-web` | Plain HTTP/1.1 server (Traefik terminates TLS), templates, auth, pages; `playbook-runner` binary | `crates/omt-web` (`http.rs` without TLS, `auth.rs`, `templates_gen.rs`, `static/style.css`, `templates/base.html`) |
 
 **UI pages** (server-rendered, no JavaScript; a run page that is still running refreshes itself with meta refresh):
-Dashboard (recent runs, next scheduled runs) · Templates (repo + playbook + inventory + vault
-secrets + SSH key + fixed options: limit, tags, check mode; argv only, no free-form args) · Schedules
-(cron, timezone, enabled, next run) · Runs (status, live log, cancel) · Inventories (paste or upload a
-YAML variables file; checked with `ansible-inventory --list`) · Secrets (vault passwords, SSH keys) ·
-Repositories (git URL, branch, deploy-key secret) · Known hosts · Settings (admin password, run retention).
+Dashboard (recent runs, next scheduled runs) · Templates (choose a repository, then its playbook from a
+dropdown filled by syncing the repository — a shallow clone that lists the YAML files that are plays —
+or type a path; inventory, vault secrets, SSH key, and fixed options: limit, tags, check mode; argv only,
+no free-form args) · Schedules (a builder — hourly, daily, weekly on chosen days, monthly, or a custom
+cron expression — with a plain-English description such as "Every Monday at 5:00 PM" and the next three
+runs) · Runs (status, the step a failed run stopped at, the per-host PLAY RECAP, each failure linked to
+its highlighted log line, the live log, download, cancel) · Inventories (paste a YAML file; checked with
+`ansible-inventory --graph`) · Secrets (vault passwords, SSH keys) · Repositories (git URL, branch,
+deploy-key secret, last synced playbooks) · Known hosts · Settings (admin password) · About (version,
+the ansible-core, collections, git, and OpenSSH the image runs, license, third-party notices).
 
 **Data** `/var/lib/playbook-runner/` (0700, non-root uid): JSON records written atomically, encrypted blobs,
 `runs/<id>.log`. No database. That removes the Postgres DB, the user and the backend network.

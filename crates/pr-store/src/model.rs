@@ -334,3 +334,47 @@ impl Record for Schedule {
         })
     }
 }
+
+/// What the last sync found in a repository: its playbooks at a commit.
+/// Keyed by the repository's id; it is a cache, rebuilt by syncing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoSnapshot {
+    /// The repository's id.
+    pub id: String,
+    pub commit: String,
+    pub playbooks: Vec<String>,
+    pub synced_at: i64,
+}
+
+impl Record for RepoSnapshot {
+    const FILE: &'static str = "repo_snapshots.json";
+    const NOUN: &'static str = "repository snapshot";
+    const BLOB_KIND: Option<&'static str> = None;
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Snapshots have no name of their own; the id keeps names unique.
+    fn name(&self) -> &str {
+        &self.id
+    }
+
+    fn write_json(&self, out: &mut String) {
+        Obj::new(out)
+            .str("id", &self.id)
+            .str("commit", &self.commit)
+            .strs("playbooks", &self.playbooks)
+            .int("synced_at", self.synced_at)
+            .end();
+    }
+
+    fn read_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            id: jsonw::str(v, "id")?,
+            commit: jsonw::str(v, "commit")?,
+            playbooks: jsonw::strs(v, "playbooks")?,
+            synced_at: jsonw::int(v, "synced_at")?,
+        })
+    }
+}

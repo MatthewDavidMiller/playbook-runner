@@ -48,6 +48,7 @@ pub const NAV: &[(&str, &str, &str)] = &[
     ("/repositories", "Repositories", "repositories"),
     ("/known-hosts", "Known hosts", "known-hosts"),
     ("/settings", "Settings", "settings"),
+    ("/about", "About", "about"),
 ];
 
 #[derive(Debug, Default)]

@@ -4,8 +4,10 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+pub mod builder;
 pub mod cron;
 pub mod zone;
 
+pub use builder::Frequency;
 pub use cron::Cron;
 pub use zone::Zone;

@@ -2,7 +2,8 @@
 
 use std::fmt::Write as _;
 
-use pr_runner::Run;
+use pr_runner::report::{Report, failed_step};
+use pr_runner::{Run, Status};
 
 use super::{card, now, time};
 use crate::app::{App, Session};
@@ -11,6 +12,93 @@ use crate::http::Response;
 
 /// How much of a log the page shows; the full log is a download.
 const LOG_TAIL: u64 = 1024 * 1024;
+
+/// The log with failure lines marked and anchored as `#log-<line>`.
+fn render_log(log: &str, report: &Report) -> String {
+    let mut out = String::with_capacity(log.len() + 1024);
+    for (i, line) in log.lines().enumerate() {
+        if report.failures.iter().any(|f| f.line == i) {
+            // display: block ends the line itself; a newline would add a blank one.
+            let _ = write!(out, "<span class=\"log-failure\" id=\"log-{i}\">{}</span>", esc(line));
+        } else if line.starts_with("TASK [")
+            || line.starts_with("PLAY ")
+            || line.starts_with("PLAY RECAP")
+        {
+            let _ = writeln!(out, "<span class=\"log-heading\">{}</span>", esc(line));
+        } else {
+            out.push_str(&esc(line));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The summary card: where a failed run stopped, the per-host recap, and
+/// each failure linked to its line in the log.
+fn summary(r: &Run, report: &Report) -> String {
+    if r.status.is_active() && report.recap.is_empty() && report.failures.is_empty() {
+        return String::new();
+    }
+    let mut out = card("summary", "Summary");
+    if r.status == Status::Failed || r.status == Status::Interrupted {
+        let step = if r.error.is_empty() { "Running the playbook" } else { failed_step(&r.error) };
+        let _ = writeln!(out, "<p>Stopped at: <strong>{}</strong>.</p>", esc(step));
+    }
+    if !report.recap.is_empty() {
+        out.push_str(
+            "<div class=\"table-wrap\"><table class=\"data-table\">\n<thead><tr><th>Host</th><th>OK</th>\
+             <th>Changed</th><th>Unreachable</th><th>Failed</th><th>Skipped</th><th>Rescued</th><th>Ignored</th></tr></thead>\n<tbody>\n",
+        );
+        for h in &report.recap {
+            let _ = write!(
+                out,
+                "<tr><td>{}{}</td>",
+                esc(&h.host),
+                if h.has_problems() {
+                    " <span class=\"state-token status-failed\">problems</span>"
+                } else {
+                    ""
+                }
+            );
+            for name in ["ok", "changed", "unreachable", "failed", "skipped", "rescued", "ignored"]
+            {
+                let _ = write!(out, "<td>{}</td>", h.count(name));
+            }
+            out.push_str("</tr>\n");
+        }
+        out.push_str("</tbody></table></div>\n");
+    }
+    if report.failures.is_empty() {
+        if r.status == Status::Succeeded {
+            out.push_str("<p class=\"empty-state\">No failures.</p>\n");
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "<h3>Failures ({})</h3>\n<ol class=\"failure-list\">",
+            report.failures.len()
+        );
+        for f in &report.failures {
+            let mut place = Vec::new();
+            if !f.task.is_empty() {
+                place.push(format!("task <strong>{}</strong>", esc(&f.task)));
+            }
+            if !f.host.is_empty() {
+                place.push(format!("on <strong>{}</strong>", esc(&f.host)));
+            }
+            let _ = writeln!(
+                out,
+                "<li><a href=\"#log-{}\">{}</a>: {}</li>",
+                f.line,
+                if place.is_empty() { "Error".to_owned() } else { place.join(" ") },
+                esc(&f.message)
+            );
+        }
+        out.push_str("</ol>\n");
+    }
+    out.push_str("</section>\n");
+    out
+}
 
 pub fn duration(seconds: i64) -> String {
     match seconds {
@@ -117,6 +205,8 @@ impl App {
             r.duration(now()).map_or_else(|| "—".to_owned(), duration),
             esc(if r.commit.is_empty() { "—" } else { &r.commit }),
         );
+        let report = pr_runner::report::parse(&log);
+        body.push_str(&summary(&r, &report));
         body.push_str(&card("log", "Log"));
         if truncated {
             let _ = writeln!(
@@ -134,7 +224,7 @@ impl App {
         let _ = writeln!(
             body,
             "<pre class=\"run-log\">{}</pre>\n</section>",
-            esc(if log.is_empty() { "(no output yet)" } else { &log })
+            if log.is_empty() { esc("(no output yet)") } else { render_log(&log, &report) }
         );
         let refresh = r.status.is_active().then_some(3);
         Some(self.page_with(

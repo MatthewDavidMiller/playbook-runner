@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use pr_common::{Error, Result};
 use pr_runner::scheduler::next_run;
-use pr_sched::Cron;
+use pr_sched::{Cron, Frequency};
 use pr_store::{Schedule, Template, new_id, validate};
 
 use super::{card, now, time, zone};
@@ -12,8 +12,80 @@ use crate::app::{App, Session};
 use crate::html::{self, Tone, esc, status_badge};
 use crate::http::{Form, Response};
 
-const CRON_HELP: &str = "Five fields: minute hour day-of-month month day-of-week, e.g. \"0 4 * * sun\" for \
-                         Sundays at 04:00, or @daily / @weekly. Times are in the server's time zone.";
+const CRON_HELP: &str = "For anything the choices above cannot express. Five fields: minute hour \
+                         day-of-month month day-of-week, e.g. \"0 4 * * sun\", or @daily / @weekly.";
+const WEEKDAYS: [&str; 7] =
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+/// "Every Monday at 5:00 PM" for a cron expression; the expression itself
+/// if it does not parse.
+pub fn describe(cron: &str) -> String {
+    Cron::parse(cron).map_or_else(|_| cron.to_owned(), |c| c.describe())
+}
+
+/// The friendly schedule builder, prefilled from `cron`. Without
+/// JavaScript every field is shown; the frequency choice decides which ones
+/// are used, and each label says which frequency it belongs to.
+fn schedule_builder(cron: &str) -> String {
+    let f = Frequency::from_cron(cron);
+    let (time, minute, weekdays, day) = match &f {
+        Frequency::Hourly { minute } => (String::from("04:00"), *minute, vec![0], 1),
+        Frequency::Daily { hour, minute } => (format!("{hour:02}:{minute:02}"), 0, vec![0], 1),
+        Frequency::Weekly { weekdays, hour, minute } => {
+            (format!("{hour:02}:{minute:02}"), 0, weekdays.clone(), 1)
+        }
+        Frequency::Monthly { day, hour, minute } => {
+            (format!("{hour:02}:{minute:02}"), 0, vec![0], *day)
+        }
+        Frequency::Custom(_) => (String::from("04:00"), 0, vec![0], 1),
+    };
+    let kinds: Vec<(String, String)> = [
+        ("hourly", "Every hour"),
+        ("daily", "Every day"),
+        ("weekly", "Every week, on chosen days"),
+        ("monthly", "Every month, on one day"),
+        ("custom", "Custom cron expression"),
+    ]
+    .iter()
+    .map(|(v, l)| ((*v).to_owned(), (*l).to_owned()))
+    .collect();
+    let mut out = String::from("<fieldset class=\"field\"><legend>When to run</legend>\n");
+    out.push_str(&html::select("frequency", "Repeat", &kinds, f.kind(), ""));
+    out.push_str(&html::field("time", "Time (daily, weekly, monthly)", "time", &time, "", false));
+    out.push_str("<div class=\"field\"><span class=\"field-label\">Days (weekly)</span>\n");
+    for (i, name) in WEEKDAYS.iter().enumerate() {
+        let checked = weekdays.iter().any(|&d| d as usize == i);
+        let _ = writeln!(
+            out,
+            "<label class=\"checkbox-label\"><input type=\"checkbox\" name=\"weekdays\" value=\"{i}\"{}> {name}</label>",
+            if checked { " checked" } else { "" }
+        );
+    }
+    out.push_str("</div>\n");
+    out.push_str(&html::field(
+        "day_of_month",
+        "Day of the month (monthly)",
+        "number",
+        &day.to_string(),
+        "1-31; months without that day are skipped.",
+        false,
+    ));
+    out.push_str(&html::field(
+        "minute",
+        "Minutes past the hour (hourly)",
+        "number",
+        &minute.to_string(),
+        "",
+        false,
+    ));
+    out.push_str(&html::field("cron", "Cron expression (custom)", "text", cron, CRON_HELP, false));
+    let _ = writeln!(
+        out,
+        "<p class=\"field-help\">Currently: <strong>{}</strong>.</p>\n</fieldset>",
+        esc(&describe(cron))
+    );
+    out
+}
 
 fn checkbox(name: &str, label: &str, checked: bool) -> String {
     format!(
@@ -103,14 +175,7 @@ impl App {
             x.map_or("", |x| &x.template),
             "",
         ));
-        body.push_str(&html::field(
-            "cron",
-            "Cron expression",
-            "text",
-            x.map_or("0 4 * * sun", |x| &x.cron),
-            CRON_HELP,
-            true,
-        ));
+        body.push_str(&schedule_builder(x.map_or("0 4 * * 0", |x| &x.cron)));
         body.push_str("<div class=\"field\">\n");
         body.push_str(&checkbox("enabled", "Enabled", x.is_none_or(|x| x.enabled)));
         body.push_str(&checkbox(
@@ -141,7 +206,7 @@ impl App {
         } else {
             body.push_str(
                 "<div class=\"table-wrap\"><table class=\"data-table\">\n<thead><tr><th>Name</th><th>Template</th>\
-                 <th>Cron</th><th>Next run</th><th></th></tr></thead>\n<tbody>\n",
+                 <th>When</th><th>Next run</th><th></th></tr></thead>\n<tbody>\n",
             );
             for x in &items {
                 let _ = writeln!(
@@ -151,7 +216,7 @@ impl App {
                     esc(&x.name),
                     if x.check_mode { " <span class=\"badge\">check</span>" } else { "" },
                     esc(&self.template_name(&x.template)),
-                    esc(&x.cron),
+                    esc(&describe(&x.cron)),
                     esc(&Self::next_label(x)),
                     html::action_button(
                         &format!("/schedules/{}/delete", x.id),
@@ -173,7 +238,16 @@ impl App {
     fn save_schedule(&self, existing: Option<Schedule>, form: &Form) -> Result<()> {
         let template = form.text("template").to_owned();
         self.store.get::<Template>(&template)?.ok_or_else(|| Error::new("Choose a template."))?;
-        let cron = form.text("cron").to_owned();
+        let weekdays: Vec<u32> = form.all("weekdays").filter_map(|d| d.parse().ok()).collect();
+        let frequency = pr_sched::builder::from_form(
+            form.text("frequency"),
+            form.text("time"),
+            form.text("minute"),
+            &weekdays,
+            form.text("day_of_month"),
+            form.text("cron"),
+        )?;
+        let cron = frequency.to_cron();
         let parsed = Cron::parse(&cron)?;
         if parsed.next_after(zone(), now()).is_none() {
             return Err(Error::new(format!("\"{cron}\" never fires.")));
@@ -215,12 +289,28 @@ impl App {
             esc(&x.name)
         );
         body.push_str(&card("details", "Details"));
+        // The next three runs, so the meaning of the expression is concrete.
+        let mut upcoming = Vec::new();
+        let mut after = now();
+        while upcoming.len() < 3 {
+            match next_run(&x, zone(), after) {
+                Some(n) => {
+                    upcoming.push(time(n));
+                    after = n;
+                }
+                None => break,
+            }
+        }
+        let upcoming = if upcoming.is_empty() { Self::next_label(&x) } else { upcoming.join(", ") };
         let _ = writeln!(
             body,
-            "<dl class=\"details-list\"><dt>Template</dt><dd><a href=\"/templates/{}\">{}</a></dd><dt>Next run</dt><dd>{}</dd></dl>",
+            "<dl class=\"details-list\"><dt>Template</dt><dd><a href=\"/templates/{}\">{}</a></dd>\
+             <dt>When</dt><dd>{}</dd><dt>Cron</dt><dd><code>{}</code></dd><dt>Next runs</dt><dd>{}</dd></dl>",
             esc(&x.template),
             esc(&self.template_name(&x.template)),
-            esc(&Self::next_label(&x)),
+            esc(&describe(&x.cron)),
+            esc(&x.cron),
+            esc(&upcoming),
         );
         let trigger = format!("schedule:{}", x.id);
         let runs: Vec<_> = self

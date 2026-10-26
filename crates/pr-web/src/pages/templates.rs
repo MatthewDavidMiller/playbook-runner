@@ -5,9 +5,11 @@
 use std::fmt::Write as _;
 
 use pr_common::{Error, Result};
-use pr_store::{Inventory, Repository, Secret, SecretKind, Template, new_id, validate};
+use pr_store::{
+    Inventory, RepoSnapshot, Repository, Secret, SecretKind, Template, new_id, validate,
+};
 
-use super::{card, now};
+use super::{card, now, time};
 use crate::app::{App, Session};
 use crate::html::{self, Tone, esc, status_badge};
 use crate::http::{Form, Response};
@@ -59,13 +61,10 @@ impl App {
         self.runner.check_inventory(content).map(|_| ())
     }
 
-    fn template_form(
-        &self,
-        s: &Session,
-        action: &str,
-        t: Option<&Template>,
-        button: &str,
-    ) -> String {
+    /// The repository chooser: a GET form, kept outside the main form
+    /// because forms cannot nest. Choosing reloads `action` with
+    /// `?repository=<id>`, which fills the playbook dropdown.
+    fn repository_chooser(&self, action: &str, selected: &str, button: &str) -> String {
         let repositories: Vec<(String, String)> = self
             .store
             .list::<Repository>()
@@ -73,6 +72,89 @@ impl App {
             .into_iter()
             .map(|r| (r.id, r.name))
             .collect();
+        if repositories.is_empty() {
+            return "<p class=\"empty-state\">Add a repository first, under <a href=\"/repositories\">Repositories</a>.</p>\n".to_owned();
+        }
+        let mut out = format!("<form method=\"GET\" action=\"{}\">\n", esc(action));
+        out.push_str(&html::select("repository", "Repository", &repositories, selected, ""));
+        let _ = writeln!(
+            out,
+            "<button type=\"submit\" class=\"button button-secondary\">{}</button>\n</form>",
+            esc(button)
+        );
+        out
+    }
+
+    /// The sync form for a repository's playbook list, with what the last
+    /// sync found. `back` is where to return afterwards.
+    fn sync_panel(&self, s: &Session, repository: &str, back: &str) -> String {
+        let mut out = String::new();
+        match self.store.get::<RepoSnapshot>(repository).ok().flatten() {
+            Some(snap) => {
+                let _ = writeln!(
+                    out,
+                    "<p class=\"field-help\">{} playbook(s) found at commit <code>{}</code>, synced {}.</p>",
+                    snap.playbooks.len(),
+                    esc(&snap.commit.chars().take(10).collect::<String>()),
+                    time(snap.synced_at)
+                );
+            }
+            None => out.push_str(
+                "<p class=\"notice notice-warning\">This repository has not been synced yet. Sync it to choose a playbook from a list.</p>\n",
+            ),
+        }
+        let _ = write!(
+            out,
+            "<form method=\"POST\" action=\"/repositories/{}/sync\">\n{}<input type=\"hidden\" name=\"back\" value=\"{}\">\n\
+             <button type=\"submit\" class=\"button button-secondary\">Sync playbooks</button>\n</form>\n",
+            esc(repository),
+            html::csrf_field(&s.csrf),
+            esc(back)
+        );
+        out
+    }
+
+    /// The playbook dropdown (from the last sync) and the free-form path
+    /// for anything the sync did not recognise.
+    fn playbook_picker(&self, repository: &str, current: &str) -> String {
+        let listed = self
+            .store
+            .get::<RepoSnapshot>(repository)
+            .ok()
+            .flatten()
+            .map(|s| s.playbooks)
+            .unwrap_or_default();
+        let in_list = listed.iter().any(|p| p == current);
+        let mut options = vec![(
+            String::new(),
+            if listed.is_empty() {
+                "No playbooks synced".to_owned()
+            } else {
+                "Choose a playbook".to_owned()
+            },
+        )];
+        options.extend(listed.iter().map(|p| (p.clone(), p.clone())));
+        let mut out =
+            html::select("playbook", "Playbook", &options, if in_list { current } else { "" }, "");
+        out.push_str(&html::field(
+            "playbook_other",
+            "Or another playbook path",
+            "text",
+            if in_list { "" } else { current },
+            "Used instead of the list when filled in, e.g. a playbook the sync did not recognise.",
+            false,
+        ));
+        out
+    }
+
+    fn template_form(
+        &self,
+        s: &Session,
+        action: &str,
+        t: Option<&Template>,
+        repository: &str,
+        button: &str,
+    ) -> String {
         let inventories: Vec<(String, String)> = self
             .store
             .list::<Inventory>()
@@ -82,22 +164,13 @@ impl App {
             .collect();
         let mut body = format!("<form method=\"POST\" action=\"{}\">\n", esc(action));
         body.push_str(&html::csrf_field(&s.csrf));
+        let _ = writeln!(
+            body,
+            "<input type=\"hidden\" name=\"repository\" value=\"{}\">",
+            esc(repository)
+        );
         body.push_str(&html::field("name", "Name", "text", t.map_or("", |t| &t.name), "", true));
-        body.push_str(&html::select(
-            "repository",
-            "Repository",
-            &repositories,
-            t.map_or("", |t| &t.repository),
-            "",
-        ));
-        body.push_str(&html::field(
-            "playbook",
-            "Playbook",
-            "text",
-            t.map_or("", |t| &t.playbook),
-            "Path inside the repository, e.g. update_homelab_vms.yml.",
-            true,
-        ));
+        body.push_str(&self.playbook_picker(repository, t.map_or("", |t| &t.playbook)));
         body.push_str(&html::select(
             "inventory",
             "Inventory",
@@ -242,9 +315,35 @@ impl App {
         }
         body.push_str("</section>\n");
         body.push_str(&card("add", "Add a template"));
-        body.push_str(&self.template_form(s, "/templates", None, "Save template"));
+        body.push_str("<p class=\"field-help\">Choose the repository first; its playbooks fill the next form's dropdown.</p>\n");
+        body.push_str(&self.repository_chooser("/templates/new", "", "Next: choose a playbook"));
         body.push_str("</section>\n");
         self.page(s, "Templates", "templates", body)
+    }
+
+    /// Step two of adding a template: the full form for one repository.
+    pub fn new_template_page(&self, s: &Session, repository: Option<&str>) -> Response {
+        let Some(repo) = repository.and_then(|id| self.store.get::<Repository>(id).ok().flatten())
+        else {
+            return self.flash_redirect(
+                s,
+                Tone::Warning,
+                "Choose a repository for the new template.",
+                "/templates",
+            );
+        };
+        let back = format!("/templates/new?repository={}", repo.id);
+        let mut body = String::from(
+            "<h1>New template</h1>\n<p class=\"page-intro\"><a href=\"/templates\">All templates</a></p>\n",
+        );
+        body.push_str(&card("repository", "Repository"));
+        body.push_str(&self.repository_chooser("/templates/new", &repo.id, "Switch repository"));
+        body.push_str(&self.sync_panel(s, &repo.id, &back));
+        body.push_str("</section>\n");
+        body.push_str(&card("add", &format!("Template using {}", repo.name)));
+        body.push_str(&self.template_form(s, "/templates", None, &repo.id, "Save template"));
+        body.push_str("</section>\n");
+        self.page(s, "New template", "templates", body)
     }
 
     fn save_template(&self, existing: Option<Template>, form: &Form) -> Result<Template> {
@@ -305,7 +404,12 @@ impl App {
         };
         tpl.name = validate::name(form.text("name"))?;
         tpl.repository = repository;
-        tpl.playbook = validate::playbook(form.text("playbook"))?;
+        let other = form.text("playbook_other");
+        let chosen = if other.is_empty() { form.text("playbook") } else { other };
+        if chosen.is_empty() {
+            return Err(Error::new("Choose a playbook, or type its path."));
+        }
+        tpl.playbook = validate::playbook(chosen)?;
         tpl.inventory = inventory;
         tpl.vault_secrets = vault_secrets;
         tpl.ssh_key = ssh_key;
@@ -324,12 +428,36 @@ impl App {
     pub fn template_create(&self, s: &Session, form: &Form) -> Response {
         match self.save_template(None, form) {
             Ok(_) => self.flash_redirect(s, Tone::Success, "Template saved.", "/templates"),
-            Err(e) => self.flash_redirect(s, Tone::Danger, e.message(), "/templates"),
+            Err(e) => {
+                let back = format!("/templates/new?repository={}", form.text("repository"));
+                let back = if pr_store::is_id(form.text("repository")) {
+                    back.as_str()
+                } else {
+                    "/templates"
+                };
+                self.flash_redirect(s, Tone::Danger, e.message(), back)
+            }
         }
     }
 
-    pub fn template_page(&self, s: &Session, id: &str) -> Option<Response> {
+    /// `repository` overrides the template's own while the operator is
+    /// switching it, so the dropdown lists the new repository's playbooks.
+    pub fn template_page(
+        &self,
+        s: &Session,
+        id: &str,
+        repository: Option<&str>,
+    ) -> Option<Response> {
         let t = self.store.get::<Template>(id).ok()??;
+        let repository = repository
+            .filter(|r| self.store.get::<Repository>(r).ok().flatten().is_some())
+            .unwrap_or(&t.repository)
+            .to_owned();
+        let back = if repository == t.repository {
+            format!("/templates/{}", t.id)
+        } else {
+            format!("/templates/{}?repository={repository}", t.id)
+        };
         let mut body = format!(
             "<h1>{}</h1>\n<p class=\"page-intro\"><a href=\"/templates\">All templates</a></p>\n",
             esc(&t.name)
@@ -360,11 +488,23 @@ impl App {
         body.push_str(&card("runs", "Recent runs"));
         body.push_str(&self.runs_table(&runs));
         body.push_str("</section>\n");
+        body.push_str(&card("repository", "Repository"));
+        body.push_str(&self.repository_chooser(
+            &format!("/templates/{}", t.id),
+            &repository,
+            "Switch repository",
+        ));
+        if repository != t.repository {
+            body.push_str("<p class=\"notice notice-warning\">Not saved yet: choose a playbook from this repository below and save.</p>\n");
+        }
+        body.push_str(&self.sync_panel(s, &repository, &back));
+        body.push_str("</section>\n");
         body.push_str(&card("edit", "Edit"));
         body.push_str(&self.template_form(
             s,
             &format!("/templates/{}", t.id),
             Some(&t),
+            &repository,
             "Save changes",
         ));
         body.push_str("</section>\n");

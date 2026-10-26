@@ -1,6 +1,7 @@
 //! The record pages. Each submodule adds its handlers to [`App`] and is
 //! wired into the router in `app.rs`.
 
+pub mod about;
 pub mod inventories;
 pub mod known_hosts;
 pub mod repositories;

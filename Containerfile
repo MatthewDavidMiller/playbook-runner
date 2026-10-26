@@ -32,7 +32,7 @@ COPY scripts/install-rust.sh /tmp/install-rust.sh
 RUN /tmp/install-rust.sh --build-only
 
 WORKDIR /src
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml LICENSE ./
 COPY .cargo .cargo
 COPY crates crates
 

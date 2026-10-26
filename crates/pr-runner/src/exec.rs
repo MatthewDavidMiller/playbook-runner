@@ -152,7 +152,7 @@ pub fn playbook_args(t: &Template, check_override: bool, vault_ids: &[String]) -
 }
 
 /// A run's scratch directory, removed on drop.
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(pub(crate) PathBuf);
 
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -171,7 +171,7 @@ impl Drop for Scratch {
 }
 
 /// A child process killed (with its process group) on drop.
-struct Supervised(Child);
+pub(crate) struct Supervised(Child);
 
 impl Drop for Supervised {
     fn drop(&mut self) {
@@ -182,7 +182,7 @@ impl Drop for Supervised {
     }
 }
 
-fn log_line(log: &mut File, text: &str) {
+pub(crate) fn log_line(log: &mut File, text: &str) {
     let _ = writeln!(log, "[playbook-runner] {text}");
 }
 
@@ -265,7 +265,7 @@ fn supervise(child: Child, deadline: Duration, cancel: &AtomicBool) -> Result<(E
     }
 }
 
-fn start_agent(
+pub(crate) fn start_agent(
     cfg: &ExecConfig,
     dir: &Path,
     keys: &[SecretBytes],
@@ -314,6 +314,72 @@ fn start_agent(
     Ok(Some((agent, socket)))
 }
 
+/// Shallow-clones `repo` into `<dir>/repo` and returns the commit, with
+/// host keys checked against the managed known_hosts and the agent at
+/// `socket` (if any) offering the deploy key. `<dir>/home` must exist.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clone_repository(
+    store: &Store,
+    cfg: &ExecConfig,
+    dir: &Path,
+    repo: &Repository,
+    socket: Option<&Path>,
+    log: &mut File,
+    redactor: &Redactor,
+    cancel: &AtomicBool,
+) -> Result<String> {
+    let known_hosts = store.known_hosts_path();
+    if !known_hosts.exists() {
+        fsio::atomic_replace(&known_hosts, b"", 16)?;
+    }
+    let ssh_command = format!(
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={}",
+        quote_for_ssh_command(&known_hosts)?
+    );
+    let home = dir.join("home");
+    log_line(log, &format!("cloning {} (branch {})", repo.url, repo.branch));
+    let mut git = base_command("git", cfg, &home);
+    git.args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "advice.detachedHead=false",
+        "clone",
+        "--quiet",
+        "--depth=1",
+        "--single-branch",
+        "--no-tags",
+    ])
+    .arg(format!("--branch={}", repo.branch))
+    .arg("--")
+    .arg(&repo.url)
+    .arg(dir.join("repo"))
+    .env("GIT_SSH_COMMAND", &ssh_command)
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_CONFIG_NOSYSTEM", "1");
+    if let Some(socket) = socket {
+        git.env("SSH_AUTH_SOCK", socket);
+    }
+    let status = run_helper(git, log, redactor, GIT_TIMEOUT, cancel)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(Error::new("cancelled during clone"));
+    }
+    if !status.success() {
+        return Err(Error::new("git clone failed"));
+    }
+    let head = base_command("git", cfg, &home)
+        .args(["-C"])
+        .arg(dir.join("repo"))
+        .args(["rev-parse", "HEAD"])
+        .stderr(Stdio::null())
+        .output()?;
+    let commit: String = String::from_utf8_lossy(&head.stdout).trim().chars().take(40).collect();
+    log_line(log, &format!("commit {commit}"));
+    Ok(commit)
+}
+
 /// Executes the run. `log` is the run's log file; `cancel` is polled.
 pub fn execute(
     store: &Store,
@@ -359,57 +425,14 @@ fn execute_inner(
 
     let agent = start_agent(cfg, &dir, &inputs.keys, log)?;
     let known_hosts = store.known_hosts_path();
-    if !known_hosts.exists() {
-        fsio::atomic_replace(&known_hosts, b"", 16)?;
+    let socket = agent.as_ref().map(|(_, socket)| socket.as_path());
+    match clone_repository(store, cfg, &dir, &inputs.repository, socket, log, &redactor, cancel) {
+        Ok(commit) => outcome.commit = commit,
+        Err(e) => {
+            outcome.cancelled = cancel.load(Ordering::Acquire);
+            return Err(e);
+        }
     }
-    let ssh_command = format!(
-        "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={}",
-        quote_for_ssh_command(&known_hosts)?
-    );
-
-    // Clone.
-    let repo = &inputs.repository;
-    log_line(log, &format!("cloning {} (branch {})", repo.url, repo.branch));
-    let mut git = base_command("git", cfg, &home);
-    git.args([
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "protocol.ext.allow=never",
-        "-c",
-        "advice.detachedHead=false",
-        "clone",
-        "--quiet",
-        "--depth=1",
-        "--single-branch",
-        "--no-tags",
-    ])
-    .arg(format!("--branch={}", repo.branch))
-    .arg("--")
-    .arg(&repo.url)
-    .arg(dir.join("repo"))
-    .env("GIT_SSH_COMMAND", &ssh_command)
-    .env("GIT_TERMINAL_PROMPT", "0")
-    .env("GIT_CONFIG_NOSYSTEM", "1");
-    if let Some((_, socket)) = &agent {
-        git.env("SSH_AUTH_SOCK", socket);
-    }
-    let status = run_helper(git, log, &redactor, GIT_TIMEOUT, cancel)?;
-    if cancel.load(Ordering::Acquire) {
-        outcome.cancelled = true;
-        return Err(Error::new("cancelled during clone"));
-    }
-    if !status.success() {
-        return Err(Error::new("git clone failed"));
-    }
-    let head = base_command("git", cfg, &home)
-        .args(["-C"])
-        .arg(dir.join("repo"))
-        .args(["rev-parse", "HEAD"])
-        .stderr(Stdio::null())
-        .output()?;
-    outcome.commit = String::from_utf8_lossy(&head.stdout).trim().chars().take(40).collect();
-    log_line(log, &format!("commit {}", outcome.commit));
 
     let playbook = dir.join("repo").join(&inputs.template.playbook);
     if !fs::symlink_metadata(&playbook).is_ok_and(|m| m.is_file()) {

@@ -9,10 +9,13 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+pub mod about;
 pub mod exec;
 pub mod redact;
+pub mod report;
 pub mod runs;
 pub mod scheduler;
+pub mod sync;
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -71,7 +74,7 @@ impl Runner {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name.starts_with("run-") || name.starts_with("check-") {
+                if ["run-", "check-", "sync-", "about-"].iter().any(|p| name.starts_with(p)) {
                     let _ = fs::remove_dir_all(entry.path());
                 }
             }
@@ -189,6 +192,11 @@ impl Runner {
         }
         buf.truncate(filled);
         Ok((String::from_utf8_lossy(&buf).into_owned(), start > 0))
+    }
+
+    /// Clones a repository and records the playbooks it contains.
+    pub fn sync_repository(&self, repository_id: &str) -> Result<pr_store::RepoSnapshot> {
+        sync::sync_repository(&self.store, &self.cfg, repository_id)
     }
 
     /// Whether ansible accepts an inventory; `Ok(None)` when ansible is not

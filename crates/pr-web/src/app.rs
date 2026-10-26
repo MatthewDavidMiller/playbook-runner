@@ -179,10 +179,11 @@ impl App {
         response.unwrap_or_else(|| self.not_found(Some(&s)))
     }
 
-    fn route_get(&self, _req: &Request, s: &Session, segments: &[&str]) -> Option<Response> {
+    fn route_get(&self, req: &Request, s: &Session, segments: &[&str]) -> Option<Response> {
         Some(match segments {
             [] => self.dashboard(s),
             ["settings"] => self.settings(s),
+            ["about"] => self.about_page(s),
             ["secrets"] => self.secrets_page(s),
             ["secrets", id] => return self.secret_page(s, id),
             ["inventories"] => self.inventories_page(s),
@@ -191,7 +192,8 @@ impl App {
             ["repositories", id] => return self.repository_page(s, id),
             ["known-hosts"] => self.known_hosts_page(s),
             ["templates"] => self.templates_page(s),
-            ["templates", id] => return self.template_page(s, id),
+            ["templates", "new"] => self.new_template_page(s, req.query_value("repository")),
+            ["templates", id] => return self.template_page(s, id, req.query_value("repository")),
             ["schedules"] => self.schedules_page(s),
             ["schedules", id] => return self.schedule_page(s, id),
             ["runs"] => self.runs_page(s),
@@ -223,6 +225,7 @@ impl App {
             ["repositories"] => self.repository_create(s, form),
             ["repositories", id] => return self.repository_update(s, id, form),
             ["repositories", id, "delete"] => return self.repository_delete(s, id),
+            ["repositories", id, "sync"] => return self.repository_sync(s, id, form),
             ["known-hosts"] => self.known_hosts_save(s, form),
             ["templates"] => self.template_create(s, form),
             ["templates", id] => return self.template_update(s, id, form),

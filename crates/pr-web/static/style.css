@@ -478,14 +478,29 @@ code {
   margin: 0 0 var(--space-3);
 }
 
-label {
+label,
+.field-label {
   display: block;
   margin: 0 0 var(--space-1);
   font-weight: 600;
 }
 
+fieldset {
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  border: 0;
+}
+
+legend {
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  font-weight: 700;
+}
+
 input[type="password"],
 input[type="text"],
+input[type="number"],
+input[type="time"],
 textarea,
 select {
   display: block;
@@ -807,4 +822,27 @@ textarea.code-input {
 
 .setup-token {
   font-family: var(--mono);
+}
+
+.run-log .log-failure {
+  display: block;
+  margin: 0 calc(var(--space-3) * -1);
+  padding: 0 var(--space-3);
+  background: var(--surface);
+  background: color-mix(in oklab, var(--danger) 18%, var(--surface-2));
+  border-inline-start: 0.25rem solid var(--danger);
+}
+
+.run-log .log-failure:target {
+  outline: 2px solid var(--danger);
+}
+
+.run-log .log-heading {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.failure-list li {
+  margin-bottom: var(--space-1);
+  overflow-wrap: anywhere;
 }

@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use pr_common::Result;
-use pr_store::{Repository, Secret, SecretKind, new_id, validate};
+use pr_store::{RepoSnapshot, Repository, Secret, SecretKind, new_id, validate};
 
 use super::{card, now, time};
 use crate::app::{App, Session};
@@ -114,6 +114,14 @@ impl App {
         r.branch = validate::branch(form.text("branch"))?;
         r.deploy_key = deploy_key;
         r.updated = t;
+        // A different remote or branch makes the synced playbook list stale.
+        let stale = self
+            .store
+            .get::<Repository>(&r.id)?
+            .is_some_and(|old| old.url != r.url || old.branch != r.branch);
+        if stale {
+            self.store.delete::<RepoSnapshot>(&r.id)?;
+        }
         self.store.put(r)
     }
 
@@ -124,11 +132,69 @@ impl App {
         }
     }
 
+    /// Clones the repository and records its playbooks, then returns to
+    /// `back` (a template or repository page) with the result.
+    pub fn repository_sync(&self, s: &Session, id: &str, form: &Form) -> Option<Response> {
+        let r = self.store.get::<Repository>(id).ok()??;
+        let back = form.text("back");
+        let back = if back.starts_with("/templates") || back.starts_with("/repositories") {
+            back.to_owned()
+        } else {
+            format!("/repositories/{}", r.id)
+        };
+        Some(match self.runner.sync_repository(&r.id) {
+            Ok(snap) => self.flash_redirect(
+                s,
+                Tone::Success,
+                format!(
+                    "Synced {}: {} playbook(s) at commit {}.",
+                    r.name,
+                    snap.playbooks.len(),
+                    snap.commit.chars().take(10).collect::<String>()
+                ),
+                &back,
+            ),
+            Err(e) => {
+                self.flash_redirect(s, Tone::Danger, format!("Sync failed: {}", e.message()), &back)
+            }
+        })
+    }
+
     pub fn repository_page(&self, s: &Session, id: &str) -> Option<Response> {
         let r = self.store.get::<Repository>(id).ok()??;
         let mut body = format!(
             "<h1>{}</h1>\n<p class=\"page-intro\"><a href=\"/repositories\">All repositories</a></p>\n",
             esc(&r.name)
+        );
+        body.push_str(&card("sync", "Playbooks"));
+        match self.store.get::<RepoSnapshot>(&r.id).ok().flatten() {
+            Some(snap) if snap.playbooks.is_empty() => {
+                let _ = writeln!(
+                    body,
+                    "<p class=\"empty-state\">No playbooks found at commit <code>{}</code>.</p>",
+                    esc(&snap.commit)
+                );
+            }
+            Some(snap) => {
+                let _ = writeln!(
+                    body,
+                    "<p class=\"field-help\">At commit <code>{}</code>, synced {}:</p>\n<ul class=\"source-list\">",
+                    esc(&snap.commit),
+                    time(snap.synced_at)
+                );
+                for p in &snap.playbooks {
+                    let _ = writeln!(body, "<li><code>{}</code></li>", esc(p));
+                }
+                body.push_str("</ul>\n");
+            }
+            None => body.push_str("<p class=\"empty-state\">Not synced yet.</p>\n"),
+        }
+        let _ = writeln!(
+            body,
+            "<form method=\"POST\" action=\"/repositories/{id}/sync\">\n{}<input type=\"hidden\" name=\"back\" value=\"/repositories/{id}\">\n\
+             <button type=\"submit\" class=\"button button-secondary\">Sync playbooks</button>\n</form>\n</section>",
+            html::csrf_field(&s.csrf),
+            id = esc(&r.id),
         );
         body.push_str(&card("edit", "Edit"));
         body.push_str(&self.repository_form(
@@ -158,6 +224,7 @@ impl App {
                 format!("\"{}\" is used by {}; change those first.", r.name, users.join(", "));
             return Some(self.flash_redirect(s, Tone::Danger, message, "/repositories"));
         }
+        let _ = self.store.delete::<RepoSnapshot>(&r.id);
         Some(match self.store.delete::<Repository>(&r.id) {
             Ok(()) => self.flash_redirect(
                 s,

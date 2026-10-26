@@ -659,3 +659,229 @@ fn schedules_validate_cron_and_protect_their_template() {
         s.get(&format!("/templates/{tpl_id}"), &[&session]).body.contains("is used by schedule")
     );
 }
+
+/// A local repository with playbooks, a task file, and a failing playbook,
+/// added to the server; returns (repository id, inventory id).
+fn playbook_fixture(s: &Server, session: &str, csrf: &str) -> (String, String) {
+    let repo = s.dir.join("fixture.git");
+    for (path, text) in [
+        (
+            "site.yml",
+            "- hosts: all\n  gather_facts: false\n  tasks:\n    - ansible.builtin.debug:\n        msg: site-ran\n",
+        ),
+        (
+            "plays/broken.yml",
+            "- hosts: all\n  gather_facts: false\n  tasks:\n    - name: Break on purpose\n      ansible.builtin.fail:\n        msg: deliberate-failure\n",
+        ),
+        ("tasks/helper.yml", "- name: not a playbook\n  ansible.builtin.debug: {}\n"),
+    ] {
+        let p = repo.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "fixture"]);
+    s.post(
+        "/repositories",
+        &[session],
+        &format!("csrf_token={csrf}&name=Fixture&url={}&branch=main", enc(&repo.to_string_lossy())),
+    );
+    let repo_id = first_id(&s.get("/repositories", &[session]), "repositories");
+    let python = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v python3"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let inventory = format!(
+        "all:\n  hosts:\n    localhost:\n      ansible_connection: local\n      ansible_python_interpreter: {}\n",
+        python.trim()
+    );
+    s.post(
+        "/inventories",
+        &[session],
+        &format!("csrf_token={csrf}&name=Local&content={}", enc(&inventory)),
+    );
+    let inv_id = first_id(&s.get("/inventories", &[session]), "inventories");
+    (repo_id, inv_id)
+}
+
+/// Waits for a run page to leave queued/running.
+fn finished_run(s: &Server, session: &str, location: &str) -> Reply {
+    let start = std::time::Instant::now();
+    loop {
+        let page = s.get(location, &[session]);
+        if !page.body.contains("status-heading\">running<")
+            && !page.body.contains("status-heading\">queued<")
+        {
+            return page;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(120));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+#[test]
+fn syncing_a_repository_fills_the_playbook_dropdown() {
+    let s = Server::start("sync");
+    let (session, csrf) = s.sign_in(PASSWORD);
+    let (repo_id, inv_id) = playbook_fixture(&s, &session, &csrf);
+    // Step one offers repositories; step two is the form for one of them.
+    assert!(s.get("/templates", &[&session]).body.contains("Next: choose a playbook"));
+    let new = format!("/templates/new?repository={repo_id}");
+    assert!(s.get(&new, &[&session]).body.contains("has not been synced yet"));
+    let r = s.post(
+        &format!("/repositories/{repo_id}/sync"),
+        &[&session],
+        &format!("csrf_token={csrf}&back={}", enc(&new)),
+    );
+    assert_eq!(r.header("location"), Some(new.as_str()));
+    let page = s.get(&new, &[&session]);
+    assert!(page.body.contains("Synced Fixture: 2 playbook(s)"), "{}", page.body);
+    assert!(page.body.contains("<option value=\"site.yml\">site.yml</option>"));
+    assert!(page.body.contains("<option value=\"plays/broken.yml\">plays/broken.yml</option>"));
+    assert!(!page.body.contains("tasks/helper.yml"), "task files are not offered");
+    // Saving with the dropdown, and with a typed path.
+    s.post(
+        "/templates",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Site&repository={repo_id}&playbook=site.yml&playbook_other=&inventory={inv_id}&verbosity=0&timeout_minutes=5"),
+    );
+    s.post(
+        "/templates",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Typed&repository={repo_id}&playbook=&playbook_other=tasks%2Fhelper.yml&inventory={inv_id}&verbosity=0&timeout_minutes=5"),
+    );
+    let list = s.get("/templates", &[&session]);
+    assert!(
+        list.body.contains("<code>site.yml</code>")
+            && list.body.contains("<code>tasks/helper.yml</code>"),
+        "{}",
+        list.body
+    );
+    // Neither chosen nor typed: refused, back on the form.
+    let r = s.post(
+        "/templates",
+        &[&session],
+        &format!("csrf_token={csrf}&name=None&repository={repo_id}&playbook=&playbook_other=&inventory={inv_id}&verbosity=0&timeout_minutes=5"),
+    );
+    assert_eq!(r.header("location"), Some(new.as_str()));
+    assert!(s.get(&new, &[&session]).body.contains("Choose a playbook"));
+    // The repository page lists what the sync found.
+    assert!(
+        s.get(&format!("/repositories/{repo_id}"), &[&session])
+            .body
+            .contains("<code>plays/broken.yml</code>")
+    );
+}
+
+#[test]
+fn a_failed_sync_says_why() {
+    let s = Server::start("sync-fail");
+    let (session, csrf) = s.sign_in(PASSWORD);
+    s.post(
+        "/repositories",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Gone&url={}&branch=main", enc("/nonexistent/repo.git")),
+    );
+    let repo_id = first_id(&s.get("/repositories", &[&session]), "repositories");
+    s.post(
+        &format!("/repositories/{repo_id}/sync"),
+        &[&session],
+        &format!("csrf_token={csrf}&back=%2Frepositories"),
+    );
+    let page = s.get("/repositories", &[&session]);
+    assert!(page.body.contains("Sync failed: git clone failed"), "{}", page.body);
+    assert!(
+        page.body.contains("does not exist")
+            || page.body.contains("not appear to be a git repository"),
+        "git's reason is shown"
+    );
+}
+
+#[test]
+fn the_schedule_builder_writes_cron_and_reads_it_back() {
+    let s = Server::start("builder");
+    let (session, csrf) = s.sign_in(PASSWORD);
+    let (repo_id, inv_id) = playbook_fixture(&s, &session, &csrf);
+    s.post(
+        "/templates",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Site&repository={repo_id}&playbook=site.yml&inventory={inv_id}&verbosity=0&timeout_minutes=5"),
+    );
+    let tpl_id = first_id(&s.get("/templates", &[&session]), "templates");
+    s.post(
+        "/schedules",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Weekly&template={tpl_id}&frequency=weekly&time=17%3A00&weekdays=1&weekdays=4&enabled=1"),
+    );
+    let list = s.get("/schedules", &[&session]);
+    assert!(list.body.contains("Every Monday and Thursday at 5:00 PM"), "{}", list.body);
+    let id = first_id(&list, "schedules");
+    let page = s.get(&format!("/schedules/{id}"), &[&session]);
+    assert!(page.body.contains("<code>0 17 * * 1,4</code>"));
+    assert_eq!(page.body.matches(" 17:00 UTC").count(), 3, "the next three runs are listed");
+    // The edit form comes back prefilled with the builder's choices.
+    assert!(page.body.contains("<option value=\"weekly\" selected>"));
+    assert!(page.body.contains("name=\"weekdays\" value=\"1\" checked"));
+    assert!(page.body.contains("value=\"17:00\""));
+    // A weekly schedule with no day is refused.
+    s.post(
+        &format!("/schedules/{id}"),
+        &[&session],
+        &format!("csrf_token={csrf}&name=Weekly&template={tpl_id}&frequency=weekly&time=17%3A00&enabled=1"),
+    );
+    assert!(
+        s.get(&format!("/schedules/{id}"), &[&session])
+            .body
+            .contains("Choose at least one day of the week")
+    );
+}
+
+#[test]
+fn a_failed_run_explains_where_it_failed() {
+    let s = Server::start("run-detail");
+    let (session, csrf) = s.sign_in(PASSWORD);
+    let (repo_id, inv_id) = playbook_fixture(&s, &session, &csrf);
+    s.post(
+        "/templates",
+        &[&session],
+        &format!("csrf_token={csrf}&name=Broken&repository={repo_id}&playbook=plays%2Fbroken.yml&inventory={inv_id}&verbosity=0&timeout_minutes=5"),
+    );
+    let tpl_id = first_id(&s.get("/templates", &[&session]), "templates");
+    let r = s.post(&format!("/templates/{tpl_id}/run"), &[&session], &format!("csrf_token={csrf}"));
+    let page = finished_run(&s, &session, r.header("location").unwrap());
+    assert!(page.body.contains("status-heading\">failed<"), "{}", page.body);
+    assert!(page.body.contains("Stopped at: <strong>Running the playbook</strong>"));
+    assert!(
+        page.body.contains(
+            "<td>localhost <span class=\"state-token status-failed\">problems</span></td>"
+        )
+    );
+    assert!(page.body.contains("task <strong>Break on purpose</strong> on <strong>localhost</strong></a>: deliberate-failure"), "{}", page.body);
+    // The summary links to the highlighted line in the log.
+    let anchor =
+        page.body.split("<a href=\"#log-").nth(1).unwrap().split('"').next().unwrap().to_owned();
+    let marked = format!("<span class=\"log-failure\" id=\"log-{anchor}\">");
+    let line =
+        page.body.split(&marked).nth(1).map(|rest| rest.split("</span>").next().unwrap_or(""));
+    assert!(line.is_some_and(|l| l.contains("FAILED!")), "anchor {anchor} marks {line:?}");
+}
+
+#[test]
+fn the_about_page_reports_the_toolchain_and_licenses() {
+    let s = Server::start("about");
+    let (session, _) = s.sign_in(PASSWORD);
+    let page = s.get("/about", &[&session]);
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains(&format!("<dt>Version</dt><dd>{}</dd>", pr_common::VERSION)));
+    assert!(page.body.contains("<dt>ansible-core</dt><dd>2."), "{}", page.body);
+    assert!(page.body.contains("Permission is hereby granted"), "the MIT license text");
+    assert!(
+        page.body.contains("ansible-core") && page.body.contains("GNU General Public License v3.0")
+    );
+    assert!(page.body.contains("<a href=\"/about\" aria-current=\"page\">About</a>"));
+}

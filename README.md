@@ -6,6 +6,14 @@ playbooks on demand and on a schedule. It replaces Semaphore in the homelab
 uses: playbook templates, cron schedules, run logs, inventory variable files,
 and encrypted vault passwords and SSH keys.
 
+- **Templates** pick a playbook from a dropdown, filled by syncing the
+  repository (a shallow clone that lists its playbooks).
+- **Schedules** are built from simple choices (hourly, daily, weekly on chosen
+  days, monthly) or a cron expression, and read back in plain English, e.g.
+  "Every Monday at 5:00 PM", with the next three runs.
+- **Runs** show where a failed run stopped, the per-host recap, and each
+  failure linked to its highlighted line in the log.
+
 Everything is first-party Rust with no third-party crates. OpenSSL's
 libcrypto, reached through hand-written declarations in `crates/pr-sys`, is
 the only third-party library linked. The shipped image runs on the official
