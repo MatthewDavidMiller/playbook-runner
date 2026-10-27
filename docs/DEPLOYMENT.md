@@ -31,7 +31,7 @@ podman run -d --name playbook-runner \
 | `--memory` = `--memory-swap` | No swap, so decrypted secrets in memory are never paged to disk. |
 | tmpfs `/run/playbook-runner` | Every run's scratch directory: the clone, the decrypted inventory, the ssh-agent socket. Also the runner user's home. Never touches a disk. |
 | `--secret ...master_key` | The master key, outside the data volume and its backups. |
-| `-v /var/lib/playbook-runner` | Persistent state: records, sealed blobs, run logs. Owned by uid 10001, mode 0700. |
+| `-v /var/lib/playbook-runner` | Persistent state, all encrypted: secrets, inventories, records, run history and logs. Owned by uid 10001, mode 0700. |
 
 The container needs outbound access to the git server and to every managed
 host over SSH, and inbound access only from Traefik on port 8080.
@@ -51,20 +51,22 @@ Environment variables, all optional except where noted:
 | `PR_SECURE_COOKIES` | `true` | Leave on behind HTTPS |
 | `PR_SESSION_HOURS` | `12` | Session lifetime |
 | `PR_TIMEZONE` | `UTC` | Zone schedules are written in and times are shown in |
-| `PR_KEEP_RUNS` | `500` | Finished runs kept |
+| `PR_ZONEINFO_DIR` | `/usr/share/zoneinfo` | Where `PR_TIMEZONE` is read from |
+| `PR_KEEP_RUNS` | `500` | Finished runs kept (10 to 100000) |
 
 ## The master key
 
-Every stored secret and inventory is sealed with AES-256-GCM under keys
-derived from one 256-bit master key. Generate it once:
+Everything stored is sealed with AES-256-GCM under keys derived from one
+256-bit master key: secrets, inventories, records, run history and logs, and
+the admin password hash. Generate it once:
 
 ```bash
 podman run --rm --entrypoint playbook-runner ghcr.io/matthewdavidmiller/playbook-runner@sha256:<digest> gen-key
 ```
 
 Store it in two places: the Ansible inventory that deploys the runner (it
-becomes the Podman secret), and Vaultwarden. **Without it, the data volume's
-secrets and inventories cannot be recovered**, which is the point: a copy of
+becomes the Podman secret), and Vaultwarden. **Without it, the data volume
+cannot be recovered**, which is the point: a copy of
 the volume or its backups holds only ciphertext.
 
 The server refuses to start with a key other than the one the data directory

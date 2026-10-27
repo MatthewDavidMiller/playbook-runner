@@ -1,8 +1,10 @@
 # Agent Instructions
 
 Workflow instructions for coding agents working in this repository. The
-architecture, security model, and stage plan live in
-[docs/DESIGN.md](docs/DESIGN.md); read it before changing anything.
+architecture and security model live in [docs/DESIGN.md](docs/DESIGN.md);
+read it before changing anything. [docs/USAGE.md](docs/USAGE.md) and
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) describe the behaviour users and
+operators rely on; update them with any change to it.
 
 ## Non-Negotiables
 

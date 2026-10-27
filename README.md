@@ -1,62 +1,47 @@
 # playbook-runner
 
-playbook-runner is a small, first-party web application that runs Ansible
-playbooks on demand and on a schedule. It replaces Semaphore in the homelab
-(see the `ansible_playbooks` repository), covering exactly what that workflow
-uses: playbook templates, cron schedules, run logs, inventory variable files,
-and encrypted vault passwords and SSH keys.
+A small web application that runs Ansible playbooks on demand and on a
+schedule. It keeps the inventory, vault passwords, and SSH keys encrypted,
+runs one playbook at a time from a git repository, and shows each run's
+result and log.
 
-- **Templates** pick a playbook from a dropdown, filled by syncing the
-  repository (a shallow clone that lists its playbooks).
-- **Schedules** are built from simple choices (hourly, daily, weekly on chosen
-  days, monthly) or a cron expression, and read back in plain English, e.g.
-  "Every Monday at 5:00 PM", with the next three runs.
-- **Runs** show where a failed run stopped, the per-host recap, and each
-  failure linked to its highlighted line in the log.
+- **Templates** pick a repository, a playbook (from a dropdown filled by
+  syncing the repository), an inventory, vault passwords, and an SSH key.
+- **Schedules** are built from simple choices or a cron expression and read
+  back in plain English ("Every Monday at 5:00 PM").
+- **Runs** show where a failed run stopped, the per-host recap, and a live
+  log you can follow or pause.
+- **Everything stored is encrypted** with one master key: secrets,
+  inventories, records, run history, and logs. A backup is ciphertext.
 
-Everything is first-party Rust with no third-party crates. OpenSSL's
-libcrypto, reached through hand-written declarations in `crates/pr-sys`, is
-the only third-party library linked. The shipped image runs on the official
-Alpine Linux base image.
+It is first-party Rust with no third-party crates. OpenSSL's libcrypto, bound
+by hand in `crates/pr-sys`, is the only third-party library linked. The image
+is built on the official Alpine Linux image, with ansible-core and its
+collections baked in, so a run never downloads anything.
 
-## Status
+## Documentation
 
-Built in stages, each one testable on its own. See
-[docs/DESIGN.md](docs/DESIGN.md) for the architecture, the secret-handling
-model, and the stage plan.
+| Page | For |
+|---|---|
+| [docs/USAGE.md](docs/USAGE.md) | Setting it up and using the interface |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Container flags, configuration, the master key, backups, upgrading |
+| [docs/DESIGN.md](docs/DESIGN.md) | Architecture and the security model |
+| [AGENTS.md](AGENTS.md) | Rules for working on the code |
 
-| Stage | Scope | State |
-|---|---|---|
-| 0 | Repository scaffold, toolbox, gates | done |
-| 1 | libcrypto FFI, crypto wrappers, common helpers | done |
-| 2 | HTTP server, auth, UI shell | done |
-| 3 | Store, keystore, secrets/inventory/repository pages | done |
-| 4 | Run engine, templates, run logs | done |
-| 5 | Scheduler | done |
-| 6 | Production image | done |
-| 7 | ansible_playbooks role integration | done (ansible_playbooks branch `playbook-runner`) |
-| 8 | Cutover from Semaphore | waiting on release, lock, and a weekly cycle |
+## Try it
 
-## Build and test
-
-Rootless Podman is the only prerequisite. Every compiler and linter lives in
-the toolbox image.
+Rootless Podman is the only prerequisite; every compiler and linter runs in a
+toolbox image.
 
 ```bash
-make install   # once: build the toolbox and install the pre-commit hook
+make install   # once: build the toolbox and install the git hook
+make dev       # serve http://127.0.0.1:8080, state in ./data
 make test      # the full gate
-make dev       # run the server at http://127.0.0.1:8080 (state in ./data)
-make image     # build the runtime image
-make test-image  # run the image, and the end-to-end tests, with VM1's flags
 ```
 
-`make dev` prints a one-time setup token on first start; open
-http://127.0.0.1:8080, enter it, and choose the admin password.
-
-## Deployment
-
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the container flags, the
-master key, first start, Traefik, and backups.
+`make dev` prints a one-time setup token on first start; open the address,
+enter it, and choose the admin password. `make help` lists the other targets
+(`image`, `test-image`, `release`).
 
 ## License
 

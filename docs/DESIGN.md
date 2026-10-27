@@ -1,135 +1,179 @@
 # Design
 
-The architecture, secret-handling model, and stage plan for playbook-runner.
+The architecture and security model of playbook-runner. For using it see
+[USAGE.md](USAGE.md); for running it see [DEPLOYMENT.md](DEPLOYMENT.md).
 
-## Context
-VM1 runs Semaphore (`public.ecr.aws/semaphore/server`) to hold the homelab inventory, run
-`ansible_playbooks` playbooks and run the weekly `update_homelab_vms.yml` schedule. It is a third-party
-image with a Postgres DB, a backend network membership, an egress network and its own backup job. We
-use only a small part of it. Replacing it with **playbook-runner** gives us a small first-party Rust
-program that does exactly what we need. It follows the conventions of `rpi-omt-client`: no crates,
-OpenSSL libcrypto reached through hand-written FFI, strict lints, and a toolbox-image build.
+## What it is for
 
-Decisions already made: name `playbook-runner`; private GitHub repo, MIT licensed; secrets encrypted with
-Alpine libcrypto through FFI; playbooks pulled by git over SSH; runtime on the official
-`docker.io/library/alpine` image.
+A homelab runs Ansible playbooks from a git repository: on demand, and on a
+weekly schedule that patches and reboots its hosts. That needs a place to keep
+the inventory variables, vault passwords, and SSH keys safely, run a playbook
+with them, and show what happened. playbook-runner does that and nothing
+more. It has no database, no users beyond one administrator, no plugins, and
+no free-form command lines, so there is little to configure wrongly and little
+to attack.
 
-## Architecture
+It follows the conventions of the sibling `rpi-omt-client` project: no
+third-party crates, OpenSSL's libcrypto reached through hand-written FFI,
+strict lints, and every build and test inside a toolbox image.
 
-**Workspace** (Cargo workspace, edition 2024; lints and
-release profile copied from `../rpi-omt-client/Cargo.toml`; `Cargo.lock` lists workspace members only):
+## Workspace
 
-| Crate | Purpose | Reuse from rpi-omt-client |
-|---|---|---|
-| `pr-sys` | FFI: libcrypto (EVP AES-256-GCM, HKDF, PBKDF2, RAND_bytes, CRYPTO_memcmp, OPENSSL_cleanse), POSIX `dup2`/`setsid`/`kill` | `crates/omt-sys` (openssl + posix modules, ABI tests) |
-| `pr-crypto` | Safe wrappers, no `unsafe` | `crates/omt-crypto/src/lib.rs` |
-| `pr-common` | JSON, atomic file IO, rand, time formatting, buffer wiping | `crates/omt-common` (`json`, `fsio`, `rand`, `timefmt`, `buf`) |
-| `pr-store` | Data-dir layout, typed records, encrypted keystore | new |
-| `pr-sched` | 5-field cron parser and next-fire calculation, TZif reader for DST-correct local time | new |
-| `pr-runner` | git fetch, ansible-playbook spawn, log capture, cancel, job queue | new |
-| `pr-web` | Plain HTTP/1.1 server (Traefik terminates TLS), templates, auth, pages; `playbook-runner` binary | `crates/omt-web` (`http.rs` without TLS, `auth.rs`, `templates_gen.rs`, `static/style.css`, `templates/base.html`) |
+A Cargo workspace (edition 2024). `Cargo.lock` lists workspace members only,
+and `scripts/check-rust.sh` fails the build otherwise.
 
-**UI pages** (server-rendered, no JavaScript; a run page that is still running refreshes itself with meta refresh):
-Dashboard (recent runs, next scheduled runs) · Templates (choose a repository, then its playbook from a
-dropdown filled by syncing the repository — a shallow clone that lists the YAML files that are plays —
-or type a path; inventory, vault secrets, SSH key, and fixed options: limit, tags, check mode; argv only,
-no free-form args) · Schedules (a builder — hourly, daily, weekly on chosen days, monthly, or a custom
-cron expression — with a plain-English description such as "Every Monday at 5:00 PM" and the next three
-runs) · Runs (status, the step a failed run stopped at, the per-host PLAY RECAP, each failure linked to
-its highlighted log line, the live log, download, cancel) · Inventories (paste a YAML file; checked with
-`ansible-inventory --graph`) · Secrets (vault passwords, SSH keys) · Repositories (git URL, branch,
-deploy-key secret, last synced playbooks) · Known hosts · Settings (admin password) · About (version,
-the ansible-core, collections, git, and OpenSSH the image runs, license, third-party notices).
+| Crate | Purpose |
+|---|---|
+| `pr-sys` | The only crate with `unsafe`. FFI to libcrypto (AES-256-GCM, HKDF, PBKDF2, HMAC, SHA-256, random, constant-time compare, memory cleansing) and a few POSIX calls |
+| `pr-crypto` | Safe wrappers: seal and open, key derivation, `MasterKey` and `SubKey` that are wiped on drop |
+| `pr-common` | Bounded file and buffer IO, strict JSON, base64, OpenSSH key parsing, time formatting, randomness |
+| `pr-store` | The data directory: typed records, sealed blobs, sealed files, sealed run logs, validation, rekeying |
+| `pr-sched` | Cron parsing, plain-English descriptions, the schedule builder, time zones (TZif and POSIX TZ) |
+| `pr-runner` | The run engine: git clone, the ansible-playbook supervisor, log redaction, the job queue, the scheduler |
+| `pr-web` | The HTTP/1.1 server, authentication, the pages, and the `playbook-runner` binary |
 
-**Data** `/var/lib/playbook-runner/` (0700, non-root uid): JSON records written atomically, encrypted blobs,
-`runs/<id>.log`. No database. That removes the Postgres DB, the user and the backend network. Everything in it
-is sealed with the master key except the key check and the public `known_hosts`: the record collections, the run
-records, the run logs, and the admin password hash, as well as the secret and inventory blobs. A copy of the
-directory is ciphertext without the key.
+## The interface
 
-## Secret handling (best practice within the constraints)
-- **Master key**: 32 random bytes kept in the external inventory and in Vaultwarden. Ansible provisions it as a
-  **Podman secret**, mounted at `/run/secrets/` (tmpfs). It is never in the data volume or its backups,
-  so a stolen backup holds ciphertext only.
-- **At rest**: AES-256-GCM. The per-purpose key is HKDF-SHA256(master, "playbook-runner v1 <kind>").
-  Each write gets a fresh random 96-bit nonce, and AAD = kind + record id + format version, so a ciphertext
-  cannot be moved to another record. The header carries a key id so `playbook-runner rekey` can rotate keys.
-  Inventories are encrypted too, since they hold credentials. Collections, run records, and the admin hash
-  are sealed whole under a second derived key, with the file's name in the authenticated data. Run logs are
-  sealed in records (a few KiB of text each, authenticated with the run number and the record's offset, with a
-  length on both sides so the live tail is read from the end), because they are appended while a run goes and
-  read while it is still running.
-- **Write-only UI**: secrets can be created, replaced and deleted, but never shown again (the page shows name,
-  timestamps and the SSH key fingerprint). They are never logged. Plaintext buffers are wiped with `OPENSSL_cleanse`.
-- **At run time**: vault passwords go to ansible through inherited pipes (`--vault-id <label>@/dev/fd/N`),
-  never to disk. SSH keys are loaded into a per-run `ssh-agent` with `ssh-add -` from stdin. The inventory is
-  decrypted to a 0600 file in a per-run directory on a `noexec` tmpfs and deleted when the run ends. The container
-  has no swap (`--memory-swap` = `--memory`). Known lines are redacted from logs: the vault passwords, each
-  line of the SSH keys, and (best effort, as the project reads no YAML) inventory values whose names look like
-  secrets. A git URL may not carry a token or password; use an ssh URL and a deploy key. `StrictHostKeyChecking=yes`
-  with the managed known_hosts.
-- **Web auth**: one admin, PBKDF2-SHA256 at 600k iterations; sessions stored as HMACs, CSRF tokens, constant-time
-  compare (port of `omt-web/src/auth.rs`); login throttling. Cookies are `Secure; HttpOnly; SameSite=Strict`; strict CSP.
-  Traefik keeps an IP allowlist in front of the app.
+Server-rendered HTML with no JavaScript, under a content security policy that
+forbids scripts, inline styles, and third-party origins. A running run's page
+refreshes with a meta refresh; the log frame is laid out from the bottom so a
+reload lands on the newest output without a script, and the page links carry a
+changing query so the browser reloads instead of jumping within the page. TLS
+is not in the program: Traefik terminates HTTPS and forwards to port 8080 over
+an internal network.
 
-## Container image
-Multi-stage `Containerfile`, with both base images pinned by digest:
-- Builder: the same official Alpine image, with the repository-pinned Rust toolchain installed by the checksum-verified
-  `scripts/install-rust.sh` (rather than trusting a second base image for the compiler) + `openssl-dev openssl-libs-static`,
-  producing a static-pie musl binary with libcrypto linked in.
-- Runtime: official `docker.io/library/alpine:<ver>` + `git openssh-client python3`, with ansible-core installed
-  through pip `--require-hashes` into `/opt/venv` and the collections from `ansible_playbooks/collections/requirements.yml`
-  baked in (runs never download collections; a repository's `collections/requirements.yml` is resolved
-  `--offline` against them before each run, and a mismatch fails the run). Non-root USER, `--read-only`, `--cap-drop=ALL`, `no-new-privileges`, tmpfs `/tmp` and `/run`.
-- `make release` builds the image, pushes it to GHCR and creates a GitHub Release (as in rpi-omt-client, no Actions).
-- `make test-image` runs the image with VM1's flags and runs the end-to-end test binaries inside it. See
-  [DEPLOYMENT.md](DEPLOYMENT.md).
+## The data directory
 
-## Stages (each ends in something we can test)
+`/var/lib/playbook-runner/`, mode 0700, owned by a non-root user:
 
-**Stage 0: Repo scaffold**
-- `mkdir playbook-runner`, `git init`, MIT `LICENSE`, `README.md`, `AGENTS.md`, `CLAUDE.md`, `.gitignore`, workspace `Cargo.toml`,
-  `rust-toolchain.toml`, toolbox Containerfile, `Makefile` (`install`, `lint`, `test`), and a script that fails if
-  `Cargo.lock` contains any non-workspace package.
-- `gh repo create MatthewDavidMiller/playbook-runner --private --source . --remote origin`, initial commit, push.
-- Test: `make test` passes on the empty crates; the repo exists on GitHub and is private.
+```text
+keycheck                   which master key this data belongs to (one-way)
+<collection>.json          secrets, inventories, repositories, templates,
+                           schedules, repository snapshots: sealed
+blobs/<kind>-<id>          the secret and inventory values: sealed
+admin.password             the administrator's PBKDF2 hash: sealed
+known_hosts                public host keys
+runs/<n>.json, runs/<n>.log   run records and logs: sealed
+```
 
-**Stage 1: Crypto and common foundations**: `pr-sys`, `pr-crypto`, `pr-common` ported and trimmed.
-- Test: NIST AES-GCM and RFC 5869 HKDF vectors, PBKDF2 vectors, round-trip, tamper/AAD-mismatch rejection, ABI tests.
+Every write replaces a whole file atomically (stage, fsync, rename, fsync the
+directory), so a crash leaves each file old or new. Collections are small and
+cached in memory; every change goes through one store under one lock, so the
+cache cannot go stale.
 
-**Stage 2: HTTP server, auth, UI shell**: `pr-web` serving login, first-run admin setup, logout, an empty dashboard,
-security headers, and the styling adapted from omt-web.
-- Test: integration tests in the style of `omt-web/tests/web.rs`; `cargo run` locally, then log in from a browser, check that CSRF is enforced and that throttling works.
+### Sealing
 
-**Stage 3: Store and keystore**: `pr-store` plus the Secrets, Inventories, Repositories and Known hosts pages.
-- Test: unit tests; a test that greps the data dir to prove no plaintext secret or inventory text is on disk;
-  a startup without the master key fails closed.
+All encryption is AES-256-GCM through libcrypto. One 256-bit master key is
+the root; each purpose derives its own key with HKDF-SHA256, so no key is used
+for two jobs.
 
-**Stage 4: Run engine**: `pr-runner` plus the Templates page, the Run button, the run log page and cancel (process-group kill).
-It runs one job at a time from a FIFO queue, and on startup marks runs left "running" as "interrupted".
-- Test: in a dev container, a test repo served by a local sshd container; a playbook with `connection: local` that reads a
-  vault-encrypted var (proves the fd pipe works); an SSH key with a passphrase-free agent; cancel mid-run.
+- **Blobs** (vault passwords, SSH keys, inventories) are sealed under the
+  store key with the kind and record id in the authenticated data, so a blob
+  copied onto another record fails to open.
+- **Files** (collections, run records, the admin hash) are sealed whole under
+  a second key with the file's name in the authenticated data.
+- **Run logs** are appended while a run goes and read while it is still going,
+  so they are sealed in records. Each holds a few KiB of text and is
+  authenticated with the run number and its own byte offset, so a record moved
+  within a log, or a log moved to another run, fails. A record's length is
+  written on both sides, so the tail is read by walking back from the end. A
+  crash can leave a partial record at the end; readers skip it.
+- Files written by older versions are plain text. They are read as such and
+  sealed when the server starts.
 
-**Stage 5: Scheduler**: `pr-sched` plus the Schedules page and run retention. Missed runs during downtime are skipped, not backfilled.
-- Test: cron unit tests, including DST transitions for America/New_York; a one-minute schedule fires in the dev container.
+`playbook-runner rekey` moves everything from one master key to another, and
+is safe to repeat. The server refuses to start with a key other than the one
+the data was written with.
 
-**Stage 6: Production image**: Containerfile, `make image`, `make release`.
-- Test: run the image with the exact VM1 flags (`--read-only --cap-drop=ALL --security-opt=no-new-privileges:true --memory=384m`) and repeat the Stage 4 checks.
+## Secret handling
 
-**Stage 7: ansible_playbooks integration** (repo conventions in its `AGENTS.md`):
-- New `roles/playbook_runner/` modeled on `roles/vaultwarden/`: input assert, defaults, podman secret for the master key,
-  the `container_network` include for `playbook_runner_container_net` plus an egress network, static IPs, launch script,
-  systemd unit, and a backup of the data dir into the existing backup flow.
-- Add a Traefik route in `proxy_config` with an IP allowlist. Lock the image through `scripts/promote_artifacts.py` (add support
-  for a first-party GHCR source if needed). Add guards in `tests/test_ansible_regressions.py`. Update docs (architecture, services,
-  security, dr-restore, variables).
-- Deploy next to Semaphore under a new hostname.
-- Test: `make test` and `make test-full`; run `vm1.yml --check` from playbook-runner.
+- **The master key** is 32 random bytes kept in two places: the Ansible
+  inventory that deploys the runner and Vaultwarden. It reaches the container
+  as a Podman secret on a tmpfs and is never in the data volume or its
+  backups, so a copy of the volume is ciphertext.
+- **Write-only interface.** Secrets and inventories can be created, replaced,
+  and deleted but never displayed; pages show names, times, sizes, and SSH key
+  fingerprints. Plaintext buffers are wiped with `OPENSSL_cleanse` when done.
+- **At run time** vault passwords go to ansible over inherited pipes
+  (`--vault-id label@/dev/fd/N`) and never touch a disk. SSH keys are loaded
+  into a per-run `ssh-agent` from stdin. The inventory is decrypted to a 0600
+  file in the run's scratch directory on a `noexec` tmpfs and removed when the
+  run ends. The container has no swap, so none of it is paged out.
+  `StrictHostKeyChecking=yes` is used with the managed `known_hosts`.
+- **Logs.** Output is masked before it is written: the vault passwords, each
+  line of the SSH keys, and inventory values whose variable names look like
+  secrets. The last is a best effort, since the project reads no YAML; it backs
+  up `no_log`, it does not replace it. Logs are also sealed on disk.
+- **No credentials in URLs.** A git URL with a token or password is refused
+  when saved and is not used if an older record has one. Private repositories
+  use an ssh URL and a deploy key.
+- **Authentication.** One administrator, PBKDF2-SHA256 at 600,000 iterations.
+  Sessions are random 256-bit identifiers kept in memory under an HMAC, with
+  CSRF tokens, same-origin checks on every POST, constant-time comparisons,
+  and login throttling per client. Cookies are `Secure; HttpOnly;
+  SameSite=Strict`. Traefik adds an IP allowlist in front.
 
-**Stage 8: Cutover**: recreate the inventory and the weekly `update_homelab_vms.yml` schedule, run one full update and reboot cycle
-(this proves the interrupted-run handling and the `container_network_migration` delay still work), then remove `roles/semaphore`,
-its DB and user, network, lock entry, backup and docs, and update the ADRs that name Semaphore as the scheduler and inventory source.
+## A run
 
-## Verification
-At the end of each stage: `make test` in playbook-runner. Stages 7 and 8 also run `make test` and `make test-full` in ansible_playbooks.
-The end-to-end check is the scheduled weekly update completing from playbook-runner, with Semaphore removed.
+1. The job leaves the queue and becomes current in one step (so a template
+   never looks idle between the two).
+2. A scratch directory is made on the tmpfs, with a private home.
+3. The deploy key and SSH keys are loaded into a private `ssh-agent`.
+4. The repository is cloned shallow, with hooks disabled and the `ext`
+   transport refused. A URL carrying a credential stops the run here.
+5. If the clone has `collections/requirements.yml`, it is resolved
+   `--offline` against the collections baked into the image. A mismatch fails
+   the run before anything executes; nothing is ever downloaded.
+6. The decrypted inventory is written, the vault passwords are put on pipes,
+   and `ansible-playbook` starts in its own process group.
+7. Output is masked and written to the sealed log as it arrives.
+8. On cancel or timeout the group gets SIGTERM, then SIGKILL after a grace
+   period. The scratch directory is deleted either way.
+
+Runs execute one at a time. Playbooks in a homelab usually touch the same
+hosts, and the update playbook reboots them, so overlapping runs would be a
+hazard. The scheduler checks once a minute, considers only the time since its
+last check, and skips an occurrence whose template is still queued or running.
+Runs left unfinished by a stopped server are marked interrupted on the next
+start.
+
+## The container image
+
+A two-stage `Containerfile`, both stages on an official Alpine image pinned by
+digest (the same digest the toolbox uses; the lint step enforces it).
+
+- **Build:** the repository-pinned Rust toolchain, installed by a
+  checksum-verified script, with OpenSSL's static libraries, produces a
+  static-pie musl binary with libcrypto linked in.
+- **Runtime:** `git`, `openssh-client`, `tzdata`, Python with ansible-core
+  installed from hash-pinned wheels (`pip --require-hashes`), and the Ansible
+  collections from `runtime/collections.yml`. The user is non-root; the image
+  is meant to run `--read-only`, `--cap-drop=ALL`, `no-new-privileges`, with
+  the memory cap and tmpfs mounts described in [DEPLOYMENT.md](DEPLOYMENT.md).
+- **Release:** `make release` runs the full gate and the image tests, pushes
+  to GHCR, tags the version, and creates the GitHub release. No CI service.
+
+## Testing
+
+- `make test` runs shellcheck, rustfmt, checks that the dependency graph has
+  only workspace members and the native libraries are only libcrypto and the C
+  library, that `unsafe` is only in `pr-sys`, clippy at pedantic with
+  `unwrap`, `expect`, and `panic` denied, and every test.
+- Unit tests cover the cryptography against published vectors, the sealed
+  formats (tampering, relocation, wrong key, torn writes, old plain files,
+  rekey), the cron and time-zone logic including daylight saving, the log
+  redactor, and the report parser.
+- End-to-end tests start the real server and the real run engine against a
+  local git repository and `ansible-playbook`: a vault-encrypted variable
+  through the pipe, the SSH agent, masking, cancel, the offline collection
+  check, sync, and a check that nothing the application stores is readable
+  without the key.
+- `make test-image` builds the image and runs it, and the end-to-end tests
+  inside it, with the same flags production uses.
+
+## Not goals
+
+No database, multiple users, role-based access, webhooks, or notifications; no
+parallel runs; no editing of playbooks; no downloading of collections at run
+time; no free-form ansible arguments. Each would widen what has to be trusted,
+and the homelab does not need them.
